@@ -1,0 +1,45 @@
+{
+  "general": {
+    "language": "zh_CN",
+    "theme": "dark",
+    "font_size": 32
+  },
+  "live": {
+    "device_keyword": "CABLE Output",
+    "backend": "faster_whisper",
+    "export_enabled": true,
+    "export_folder": "C:\\VoxScribe\\transcripts",
+    "file_name": "Meeting Transcript {date_time}",
+    "mode": "append_below",
+    "chunk_seconds": 3.5,
+    "silence_threshold": 0.0025,
+    "obs_file_name": "obs_live_caption.txt"
+  },
+  "folder_watch": {
+    "enabled": false,
+    "input_folder": "C:\\VoxScribe\\media",
+    "output_folder": "C:\\VoxScribe\\offline-transcripts",
+    "delete_processed_files": false,
+    "export_formats": ["txt"]
+  },
+  "audio_processing": {
+    "mode": "noise_reduce",
+    "demucs_model": "htdemucs",
+    "speaker_identification": false,
+    "speaker_count": 0
+  },
+  "model": {
+    "backend": "qwen3_asr",
+    "model_path": "C:\\VoxScribe\\models\\Qwen3-ASR-1.7B",
+    "qwen3_asr_path": "C:\\VoxScribe\\models\\Qwen3-ASR-1.7B",
+    "faster_whisper_path": "C:\\VoxScribe\\models\\faster-whisper-large-v3",
+    "external_cli_path": "",
+    "external_cli_command": "",
+    "language": "auto",
+    "use_gpu": true
+  },
+  "hotkeys": {
+    "record_toggle": "Ctrl+Shift+R",
+    "floating_window": "Ctrl+Shift+F"
+  }
+}

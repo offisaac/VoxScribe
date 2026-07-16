@@ -1,0 +1,27 @@
+# Local application runtime and AI model weights
+runtime/
+models/
+cache/
+
+# User data and generated output
+data/
+exports/
+logs/
+shortcuts/
+config/settings.json
+
+# Packaged binaries and local build output
+*.exe
+*.lnk
+bin/
+obj/
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local documentation generated for a specific installation
+INSTALLATION.md
+ACCEPTANCE_REPORT.md
