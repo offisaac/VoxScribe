@@ -1,4 +1,5 @@
 import json
+import importlib.util
 from pathlib import Path
 
 import numpy as np
@@ -9,9 +10,9 @@ from PySide6.QtWidgets import QApplication
 from voxscribe.backends import FunASRNanoBackend, _speech_intervals
 from voxscribe.config import SettingsStore
 from voxscribe.exports import write_exports
-from voxscribe.streaming import QwenStreamingSession
+from voxscribe.streaming import QwenStreamingService, QwenStreamingSession
 from voxscribe.tasks import TaskStore
-from voxscribe.transcription import Segment, TranscriptionResult
+from voxscribe.transcription import Segment, TranscriptionResult, normalize_recognition_text
 from voxscribe.viewer import TranscriptionViewer
 
 
@@ -30,6 +31,11 @@ def test_result_round_trip():
     assert loaded.text == "你好"
     assert loaded.segments[0].speaker == "说话人 1"
     assert loaded.segments[0].words[0]["word"] == "你"
+
+
+def test_recognition_text_is_simplified_chinese_and_keeps_english():
+    assert normalize_recognition_text("開放時間：早上九點。") == "开放时间：早上九点。"
+    assert normalize_recognition_text("Hello, ChatGPT.") == "Hello, ChatGPT."
 
 
 def test_precise_exports(tmp_path):
@@ -75,9 +81,44 @@ def test_settings_atomic_merge(tmp_path):
     store = SettingsStore(path)
     assert store.get("general", "font_size") == 48
     assert store.get("folder_watch", "enabled") is True
+    assert store.get("live", "recognition_mode") == "streaming"
+    assert store.get("live", "standard_backend") == "qwen3_asr"
     store.update_section("live", {"chunk_seconds": 5.0})
     assert json.loads(path.read_text(encoding="utf-8"))["live"]["chunk_seconds"] == 5.0
     assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_qwen_is_available_in_both_live_modes(tmp_path, app, monkeypatch):
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_desktop_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+    store = SettingsStore(tmp_path / "settings.json")
+    monkeypatch.setattr(desktop, "SETTINGS", store)
+
+    dialog = desktop.SettingsDialog(store)
+    assert dialog.live_recognition_mode.findData("streaming") >= 0
+    assert dialog.live_recognition_mode.findData("standard") >= 0
+    assert dialog.live_backend.findData("qwen3_asr") >= 0
+    dialog.live_recognition_mode.setCurrentIndex(dialog.live_recognition_mode.findData("standard"))
+    dialog.live_backend.setCurrentIndex(dialog.live_backend.findData("qwen3_asr"))
+    dialog._save()
+
+    assert store.get("live", "recognition_mode") == "standard"
+    assert store.get("live", "backend") == "qwen3_asr"
+    recorder = desktop.LiveRecorder(None, None, desktop.Events(), TaskStore(tmp_path / "live.db"))
+    assert recorder.recognition_mode == "standard"
+    assert recorder.backend_name == "qwen3_asr"
+    assert recorder.chunk_seconds == store.get("live", "chunk_seconds")
+
+    store.update_section(
+        "live",
+        {"recognition_mode": "streaming", "backend": "qwen3_asr"},
+    )
+    recorder = desktop.LiveRecorder(None, None, desktop.Events(), TaskStore(tmp_path / "stream.db"))
+    assert recorder.recognition_mode == "streaming"
+    assert recorder.backend_name == "qwen3_asr"
+    assert recorder.chunk_seconds == store.get("live", "stream_chunk_seconds")
 
 
 def test_vad_intervals_follow_speech():
@@ -158,6 +199,49 @@ def test_qwen_streaming_http_session(monkeypatch):
     assert partial["text"] == "partial"
     assert final["text"] == "final"
     assert calls[0][0].endswith("/api/start")
+    assert json.loads(calls[0][1].decode("utf-8")) == {
+        "chunk_size_sec": 0.8,
+        "unfixed_chunk_num": 4,
+        "unfixed_token_num": 5,
+    }
     assert calls[1][0].endswith("/api/chunk?session_id=session-1")
     assert len(calls[1][1]) == 16000 * 4
     assert calls[2][0].endswith("/api/finish?session_id=session-1")
+
+
+def test_qwen_streaming_session_retries_transient_failure(monkeypatch):
+    attempts = []
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise ConnectionError("service is restarting")
+            return self
+
+    service = QwenStreamingService()
+    monkeypatch.setattr(service, "ensure_started", lambda: None)
+    monkeypatch.setattr("voxscribe.streaming.QwenStreamingSession", FakeSession)
+    monkeypatch.setattr("voxscribe.streaming.time.sleep", lambda _seconds: None)
+
+    assert service.create_session().__class__ is FakeSession
+    assert len(attempts) == 3
+
+
+def test_qwen_service_stop_terminates_wsl_immediately(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+
+    service = QwenStreamingService(distro="Ubuntu")
+    service.ready = True
+    monkeypatch.setattr("voxscribe.streaming.subprocess.run", fake_run)
+
+    service.stop()
+
+    assert calls == [["wsl.exe", "--shutdown"]]
+    assert service.ready is False

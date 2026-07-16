@@ -177,6 +177,20 @@ from PySide6.QtWidgets import (
 )
 
 
+def update_caption_widget(widget, text, append=False):
+    scroll = widget.verticalScrollBar()
+    previous_value = scroll.value()
+    follow_latest = scroll.maximum() - previous_value <= max(12, scroll.pageStep() // 12)
+    if append:
+        widget.append(text)
+    else:
+        widget.setPlainText(text)
+    if follow_latest:
+        scroll.setValue(scroll.maximum())
+    else:
+        scroll.setValue(min(previous_value, scroll.maximum()))
+
+
 class Events(QObject):
     status = Signal(str)
     live_text = Signal(str)
@@ -188,6 +202,10 @@ class Events(QObject):
     record_hotkey = Signal()
     floating_hotkey = Signal()
     audio_level = Signal(float)
+    live_started = Signal()
+    live_start_failed = Signal(str)
+    live_stopped = Signal(bool)
+    live_stop_failed = Signal(str)
 
 
 class SettingsDialog(QDialog):
@@ -195,7 +213,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.store = store
         self.setWindowTitle("偏好设置")
-        self.resize(760, 560)
+        self.resize(820, 720)
         layout = QVBoxLayout(self)
         content = QHBoxLayout()
         self.navigation = QListWidget()
@@ -267,6 +285,15 @@ class SettingsDialog(QDialog):
         form.addRow("导出文件夹", self._folder_picker(self.live_export_folder))
         self.live_file_name = QLineEdit(self.store.get("live", "file_name"))
         form.addRow("文件名模板", self.live_file_name)
+        self.live_recognition_mode = QComboBox()
+        self.live_recognition_mode.addItem("真流式（低延迟，Qwen3-ASR）", "streaming")
+        self.live_recognition_mode.addItem("普通分段（稳定备用，Qwen3-ASR）", "standard")
+        mode_index = self.live_recognition_mode.findData(
+            self.store.get("live", "recognition_mode", "streaming")
+        )
+        if mode_index >= 0:
+            self.live_recognition_mode.setCurrentIndex(mode_index)
+        form.addRow("录制识别方式", self.live_recognition_mode)
         self.live_chunk_seconds = QDoubleSpinBox()
         self.live_chunk_seconds.setRange(1.5, 30.0)
         self.live_chunk_seconds.setSingleStep(0.5)
@@ -282,27 +309,77 @@ class SettingsDialog(QDialog):
         self.live_device_keyword = QLineEdit(self.store.get("live", "device_keyword", "CABLE Output"))
         form.addRow("默认音频设备关键词", self.live_device_keyword)
         self.live_backend = QComboBox()
-        for backend_name, info in BACKEND_INFO.items():
+        for backend_name in ("qwen3_asr", "fun_asr_nano", "faster_whisper"):
+            info = BACKEND_INFO[backend_name]
             self.live_backend.addItem(info["label"], backend_name)
-        live_backend_index = self.live_backend.findData(self.store.get("live", "backend", "faster_whisper"))
+        live_backend_index = self.live_backend.findData(
+            self.store.get("live", "standard_backend", "qwen3_asr")
+        )
         if live_backend_index >= 0:
             self.live_backend.setCurrentIndex(live_backend_index)
-        form.addRow("实时识别模型", self.live_backend)
+        form.addRow("普通模式模型", self.live_backend)
+        self.stream_latency = QDoubleSpinBox()
+        self.stream_latency.setDecimals(1)
+        self.stream_latency.setRange(0.4, 2.0)
+        self.stream_latency.setSingleStep(0.1)
+        self.stream_latency.setValue(float(self.store.get("live", "stream_chunk_seconds", 0.8)))
+        self.stream_latency.setSuffix(" 秒")
+        form.addRow("流式音频块", self.stream_latency)
+        self.stream_unfixed_chunks = QSpinBox()
+        self.stream_unfixed_chunks.setRange(1, 12)
+        self.stream_unfixed_chunks.setValue(
+            int(self.store.get("live", "stream_unfixed_chunk_num", 4))
+        )
+        form.addRow("流式修订窗口", self.stream_unfixed_chunks)
+        self.stream_unfixed_tokens = QSpinBox()
+        self.stream_unfixed_tokens.setRange(1, 20)
+        self.stream_unfixed_tokens.setValue(
+            int(self.store.get("live", "stream_unfixed_token_num", 5))
+        )
+        form.addRow("末尾待确认词元", self.stream_unfixed_tokens)
+        self.stream_fallback = QCheckBox("真流式不可用时自动切换到普通模式")
+        self.stream_fallback.setChecked(
+            self.store.get("live", "stream_fallback_enabled", True)
+        )
+        form.addRow(self.stream_fallback)
+        self.release_after_stop = QCheckBox("停止录制后立即释放模型内存和显存")
+        self.release_after_stop.setChecked(
+            self.store.get("live", "release_model_after_stop", False)
+        )
+        form.addRow(self.release_after_stop)
+        stream_note = QLabel("0.6–0.8 秒响应更快；修订窗口越大，字幕越稳定但确认稍慢。参数从下一次录制生效。")
+        stream_note.setObjectName("hintText")
+        stream_note.setWordWrap(True)
+        form.addRow(stream_note)
         self.live_backend_note = QLabel()
         self.live_backend_note.setObjectName("hintText")
         self.live_backend_note.setWordWrap(True)
         form.addRow(self.live_backend_note)
+        self.live_recognition_mode.currentIndexChanged.connect(self._live_backend_changed)
         self.live_backend.currentIndexChanged.connect(self._live_backend_changed)
         self._live_backend_changed()
         return page
 
     def _live_backend_changed(self):
-        if self.live_backend.currentData() == "fun_asr_nano":
+        is_qwen_streaming = self.live_recognition_mode.currentData() == "streaming"
+        self.stream_latency.setEnabled(is_qwen_streaming)
+        self.stream_unfixed_chunks.setEnabled(is_qwen_streaming)
+        self.stream_unfixed_tokens.setEnabled(is_qwen_streaming)
+        self.stream_fallback.setEnabled(is_qwen_streaming)
+        self.live_backend.setEnabled(not is_qwen_streaming)
+        self.live_chunk_seconds.setEnabled(not is_qwen_streaming)
+        self.live_silence.setEnabled(not is_qwen_streaming)
+        if is_qwen_streaming:
+            self.live_backend_note.setText("真流式使用 Qwen3-ASR 1.7B；服务异常时自动切换到普通 Qwen，不依赖流式会话。")
+            return
+        if self.live_backend.currentData() == "qwen3_asr":
+            self.live_backend_note.setText("普通分段同样使用 Qwen3-ASR 1.7B，由 Windows 直接加载；不依赖 WSL 流式服务，是稳定保底模式。")
+        elif self.live_backend.currentData() == "fun_asr_nano":
             if self.live_chunk_seconds.value() > 2.0:
                 self.live_chunk_seconds.setValue(2.0)
-            self.live_backend_note.setText("高速模式使用 2 秒分段，优先降低字幕等待时间；Qwen3-ASR 1.7B 仍是默认精度模式。")
+            self.live_backend_note.setText("普通分段使用 Fun-ASR-Nano，启动稳定且不依赖 WSL 流式服务。")
         else:
-            self.live_backend_note.setText("实时模型只影响录制字幕；文件转写模型可在“识别模型”中单独设置。")
+            self.live_backend_note.setText("普通分段按设定时长整段识别，是流式模式的稳定备用方案。")
 
     def _folder_tab(self):
         page = QWidget()
@@ -354,13 +431,13 @@ class SettingsDialog(QDialog):
         self.model_backend.currentIndexChanged.connect(self._model_backend_changed)
         self.model_language = QComboBox()
         self.model_language.addItem("自动检测（中英混说）", "auto")
-        self.model_language.addItem("中文", "Chinese")
+        self.model_language.addItem("简体中文", "Chinese")
         self.model_language.addItem("英文", "English")
         language_index = self.model_language.findData(self.store.get("model", "language", "auto"))
         if language_index >= 0:
             self.model_language.setCurrentIndex(language_index)
         form.addRow("语言", self.model_language)
-        note = QLabel("Qwen3-ASR 1.7B 是默认精度模式；Fun-ASR-Nano 是低延迟高速模式。切换模型无需改动录制和文件夹工作流。")
+        note = QLabel("仅用于简体中文和英文识别；支持中英混说自动检测，不启用翻译。中文结果统一输出为简体。")
         note.setWordWrap(True)
         note.setObjectName("hintText")
         form.addRow(note)
@@ -435,11 +512,22 @@ class SettingsDialog(QDialog):
             "live",
             {
                 "device_keyword": self.live_device_keyword.text().strip() or "CABLE Output",
-                "backend": self.live_backend.currentData(),
+                "recognition_mode": self.live_recognition_mode.currentData(),
+                "standard_backend": self.live_backend.currentData(),
+                "backend": (
+                    "qwen3_asr"
+                    if self.live_recognition_mode.currentData() == "streaming"
+                    else self.live_backend.currentData()
+                ),
                 "export_enabled": self.live_export_enabled.isChecked(),
                 "export_folder": self.live_export_folder.text().strip(),
                 "file_name": self.live_file_name.text().strip() or "Meeting Transcript {date_time}",
                 "chunk_seconds": self.live_chunk_seconds.value(),
+                "stream_chunk_seconds": self.stream_latency.value(),
+                "stream_unfixed_chunk_num": self.stream_unfixed_chunks.value(),
+                "stream_unfixed_token_num": self.stream_unfixed_tokens.value(),
+                "stream_fallback_enabled": self.stream_fallback.isChecked(),
+                "release_model_after_stop": self.release_after_stop.isChecked(),
                 "silence_threshold": self.live_silence.value(),
             },
         )
@@ -528,12 +616,30 @@ class ModelManager:
 
     def unload(self):
         with self.lock:
+            backend = self.backend
             self.backend = None
             self.backend_key = None
+            del backend
+            import gc
+
+            gc.collect()
             import torch
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            gc.collect()
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+
+                    get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+                    get_current_process.restype = ctypes.c_void_p
+                    empty_working_set = ctypes.windll.psapi.EmptyWorkingSet
+                    empty_working_set.argtypes = [ctypes.c_void_p]
+                    empty_working_set.restype = ctypes.c_bool
+                    empty_working_set(get_current_process())
+                except Exception:
+                    LOGGER.exception("无法归还 Windows 模型工作集")
 
 
 class LiveRecorder:
@@ -542,14 +648,16 @@ class LiveRecorder:
         self.streaming_service = streaming_service
         self.events = events
         self.tasks = tasks
-        self.audio_queue = queue.Queue(maxsize=256)
+        self.audio_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.stream = None
         self.thread = None
         self.sample_rate = 48000
+        self.recognition_mode = SETTINGS.get("live", "recognition_mode", "streaming")
         backend_name = SETTINGS.get("live", "backend", "faster_whisper")
+        self.backend_name = backend_name
         configured_chunk = float(SETTINGS.get("live", "chunk_seconds", 3.5))
-        if backend_name == "qwen3_asr":
+        if self.recognition_mode == "streaming":
             self.chunk_seconds = float(SETTINGS.get("live", "stream_chunk_seconds", 0.8))
         else:
             self.chunk_seconds = min(configured_chunk, 2.0) if backend_name == "fun_asr_nano" else configured_chunk
@@ -562,6 +670,8 @@ class LiveRecorder:
         self.session_started = 0.0
         self.last_text = ""
         self.last_level_at = 0.0
+        self.last_overflow_at = 0.0
+        self.audio_block_seconds = 0.1
         self.streaming_session = None
 
     def start(self, device_index: int):
@@ -574,9 +684,11 @@ class LiveRecorder:
         refresh_settings_paths()
         LIVE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         self.stop_event.clear()
+        self.recognition_mode = SETTINGS.get("live", "recognition_mode", "streaming")
         backend_name = SETTINGS.get("live", "backend", "faster_whisper")
+        self.backend_name = backend_name
         configured_chunk = float(SETTINGS.get("live", "chunk_seconds", 3.5))
-        if backend_name == "qwen3_asr":
+        if self.recognition_mode == "streaming":
             self.chunk_seconds = float(SETTINGS.get("live", "stream_chunk_seconds", 0.8))
         else:
             self.chunk_seconds = min(configured_chunk, 2.0) if backend_name == "fun_asr_nano" else configured_chunk
@@ -594,13 +706,35 @@ class LiveRecorder:
         if self.export_enabled:
             self.session_file.write_text("", encoding="utf-8")
             self.fixed_obs_file.write_text("", encoding="utf-8")
-        self.task_id = self.tasks.start(self.session_file, "live", backend_name)
         self.segments = []
         self.session_started = time.monotonic()
         self.last_text = ""
         self.last_level_at = 0.0
-        if backend_name == "qwen3_asr":
-            self.streaming_session = self.streaming_service.create_session()
+        self.last_overflow_at = 0.0
+        self.streaming_session = None
+        if self.recognition_mode == "streaming":
+            try:
+                self.streaming_session = self.streaming_service.create_session()
+            except Exception:
+                if not SETTINGS.get("live", "stream_fallback_enabled", True):
+                    raise
+                self.streaming_service.stop()
+                self.recognition_mode = "standard"
+                backend_name = SETTINGS.get("live", "standard_backend", "qwen3_asr")
+                self.backend_name = backend_name
+                configured_chunk = float(SETTINGS.get("live", "chunk_seconds", 3.5))
+                self.chunk_seconds = (
+                    min(configured_chunk, 2.0)
+                    if backend_name == "fun_asr_nano"
+                    else configured_chunk
+                )
+                self.events.status.emit(
+                    f"真流式暂不可用，已自动切换到 {BACKEND_INFO[backend_name]['label']} 普通模式"
+                )
+                self.manager.ensure_loaded(backend_name)
+        else:
+            self.manager.ensure_loaded(backend_name)
+        self.task_id = self.tasks.start(self.session_file, "live", self.backend_name)
         self.events.history_changed.emit()
 
         def callback(indata, frames, time_info, status):
@@ -611,15 +745,13 @@ class LiveRecorder:
             if now - self.last_level_at >= 0.08:
                 self.last_level_at = now
                 self.events.audio_level.emit(float(np.sqrt(np.mean(np.square(mono)) + 1e-12)))
-            try:
-                self.audio_queue.put_nowait(mono)
-            except queue.Full:
-                try:
-                    self.audio_queue.get_nowait()
-                    self.audio_queue.put_nowait(mono)
-                except queue.Empty:
-                    pass
-                self.events.status.emit("实时音频缓存已满，已丢弃最旧数据以保持低延迟")
+            self.audio_queue.put_nowait(mono)
+            backlog_seconds = self.audio_queue.qsize() * self.audio_block_seconds
+            if backlog_seconds >= 5.0 and now - self.last_overflow_at >= 10.0:
+                self.last_overflow_at = now
+                self.events.status.emit(
+                    f"识别暂时落后约 {backlog_seconds:.0f} 秒，正在追赶；音频不会丢失"
+                )
 
         self.stream = sd.InputStream(
             device=device_index,
@@ -627,7 +759,7 @@ class LiveRecorder:
             channels=1,
             dtype="float32",
             callback=callback,
-            blocksize=0,
+            blocksize=max(1, int(self.sample_rate * self.audio_block_seconds)),
         )
         self.stream.start()
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -643,12 +775,22 @@ class LiveRecorder:
             except Exception:
                 pass
             self.stream = None
+        self.audio_queue.put_nowait(None)
         if self.thread is not None and self.thread is not threading.current_thread():
-            self.thread.join(timeout=15)
+            worker = self.thread
+            worker.join(timeout=180)
+            if worker.is_alive():
+                LOGGER.warning("实时音频队列未能在 180 秒内完成收尾，正在强制结束识别服务")
+                self.streaming_service.stop()
+                worker.join(timeout=3)
             self.thread = None
         if self.streaming_session is not None:
             try:
-                response = self.streaming_session.finish()
+                response = (
+                    self.streaming_session.finish()
+                    if self.streaming_service.ready
+                    else {"text": ""}
+                )
                 text = (response.get("text") or "").strip()
                 if text:
                     elapsed = time.monotonic() - self.session_started
@@ -666,28 +808,43 @@ class LiveRecorder:
         chunks = []
         total = 0
         target = int(self.sample_rate * self.chunk_seconds)
-        backend_name = SETTINGS.get("live", "backend", "faster_whisper")
-        while not self.stop_event.is_set():
+        backend_name = self.backend_name
+        is_streaming = self.recognition_mode == "streaming"
+        while True:
             try:
                 block = self.audio_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
-            chunks.append(block)
-            total += len(block)
-            if total < target:
+            finishing = block is None
+            if not finishing:
+                chunks.append(block)
+                total += len(block)
+            if total < target and not finishing:
                 continue
+            if total == 0 and finishing:
+                break
             audio = np.concatenate(chunks)
             chunks = []
             total = 0
-            if backend_name != "qwen3_asr" and float(np.sqrt(np.mean(np.square(audio)) + 1e-12)) < self.silence_threshold:
+            if not is_streaming and float(np.sqrt(np.mean(np.square(audio)) + 1e-12)) < self.silence_threshold:
+                if finishing:
+                    break
                 continue
             try:
                 if self.sample_rate != 16000:
                     from scipy.signal import resample_poly
 
                     audio = resample_poly(audio, 16000, self.sample_rate).astype(np.float32)
-                if backend_name == "qwen3_asr":
-                    response = self.streaming_session.push(audio)
+                if is_streaming:
+                    try:
+                        response = self.streaming_session.push(audio)
+                    except Exception:
+                        LOGGER.exception("Qwen 流式会话中断，正在自动恢复")
+                        self.events.status.emit("识别服务中断，正在自动恢复…")
+                        self.streaming_service.ready = False
+                        self.streaming_session = self.streaming_service.create_session()
+                        response = self.streaming_session.push(audio)
+                        self.events.status.emit("识别服务已自动恢复")
                     text = (response.get("text") or "").strip()
                     if text and text != self.last_text:
                         self.last_text = text
@@ -695,12 +852,14 @@ class LiveRecorder:
                         self.segments = [Segment(0.0, elapsed, text)]
                         self._save_snapshot(text)
                         self.events.live_snapshot.emit(text)
+                    if finishing:
+                        break
                     continue
                 language = SETTINGS.get("model", "language", "auto")
                 text = self.manager.transcribe(
                     (audio, 16000),
                     language=None if language == "auto" else language,
-                    backend_name=SETTINGS.get("live", "backend", "faster_whisper"),
+                    backend_name=backend_name,
                 )
                 if text:
                     text = self._remove_overlap(text)
@@ -712,6 +871,8 @@ class LiveRecorder:
             except Exception as exc:
                 LOGGER.exception("实时识别失败")
                 self.events.error.emit(f"实时识别失败：{exc}")
+            if finishing:
+                break
 
     def _remove_overlap(self, text):
         text = text.strip()
@@ -944,6 +1105,11 @@ class FloatingCaptionWindow(QWidget):
             "QPushButton{background:#29303a;border:0;border-radius:5px;padding:5px 10px;color:white;}"
             "QLabel{color:#aeb8c8;}"
             "QTextEdit{background:transparent;border:0;color:white;padding:8px;}"
+            "QScrollBar:vertical{background:transparent;width:9px;margin:3px 1px;}"
+            "QScrollBar::handle:vertical{background:#3b4658;border-radius:4px;min-height:30px;}"
+            "QScrollBar::handle:vertical:hover{background:#526178;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
         )
         outer.addWidget(frame)
         layout = QVBoxLayout(frame)
@@ -986,16 +1152,10 @@ class FloatingCaptionWindow(QWidget):
         self.text.setFont(QFont("Microsoft YaHei UI", self.font_size))
 
     def append_text(self, text):
-        self.text.append(text)
-        cursor = self.text.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.text.setTextCursor(cursor)
+        update_caption_widget(self.text, text, append=True)
 
     def set_text(self, text):
-        self.text.setPlainText(text)
-        cursor = self.text.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.text.setTextCursor(cursor)
+        update_caption_widget(self.text, text)
 
     def show_for(self, anchor):
         self.show()
@@ -1038,11 +1198,16 @@ class MainWindow(QMainWindow):
         self.streaming_service = QwenStreamingService(
             SETTINGS.get("live", "streaming_url", "http://127.0.0.1:8765"),
             SETTINGS.get("live", "wsl_distro", "Ubuntu"),
+            SETTINGS.get("live", "stream_chunk_seconds", 0.8),
+            SETTINGS.get("live", "stream_unfixed_chunk_num", 4),
+            SETTINGS.get("live", "stream_unfixed_token_num", 5),
         )
         self.recorder = LiveRecorder(self.manager, self.streaming_service, self.events, self.tasks)
         self.floating = FloatingCaptionWindow()
         self.device_indices = []
         self.model_is_ready = False
+        self.live_starting = False
+        self.live_stopping = False
         self.setWindowTitle("VoxScribe")
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "voxscribe.ico")))
         self.resize(1080, 720)
@@ -1092,6 +1257,11 @@ class MainWindow(QMainWindow):
             "QComboBox,QSpinBox,QDoubleSpinBox,QLineEdit{background:#171d26;border:1px solid #344052;border-radius:8px;padding:8px;color:#e8edf5;}"
             "QComboBox:focus,QSpinBox:focus,QDoubleSpinBox:focus,QLineEdit:focus{border-color:#4a8cff;}"
             "QTextEdit{background:#0b0f15;border:1px solid #293343;border-radius:10px;padding:14px;selection-background-color:#315f9f;}"
+            "QScrollBar:vertical{background:transparent;width:10px;margin:5px 2px;}"
+            "QScrollBar::handle:vertical{background:#354154;border-radius:5px;min-height:32px;}"
+            "QScrollBar::handle:vertical:hover{background:#526178;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
             "QTableWidget{background:#0b0f15;border:1px solid #293343;border-radius:10px;gridline-color:#202938;alternate-background-color:#111824;}"
             "QHeaderView::section{background:#1b2330;color:#c9d4e3;border:0;border-right:1px solid #303b4c;padding:8px;}"
             "QTabWidget::pane{border:0;margin-top:8px;}"
@@ -1222,6 +1392,8 @@ class MainWindow(QMainWindow):
         self.live_edit = QTextEdit()
         self.live_edit.setReadOnly(True)
         self.live_edit.setPlaceholderText("")
+        self.live_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.live_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.caption_stack.addWidget(self.live_edit)
         self.caption_stack.setCurrentIndex(0)
         layout.addWidget(self.caption_stack, 1)
@@ -1348,6 +1520,10 @@ class MainWindow(QMainWindow):
         self.events.record_hotkey.connect(self._hotkey_record_toggle)
         self.events.floating_hotkey.connect(self._show_floating)
         self.events.audio_level.connect(self._update_audio_meter)
+        self.events.live_started.connect(self._live_started)
+        self.events.live_start_failed.connect(self._live_start_failed)
+        self.events.live_stopped.connect(self._live_stopped)
+        self.events.live_stop_failed.connect(self._live_stop_failed)
 
     def _start_hotkeys(self):
         try:
@@ -1359,10 +1535,7 @@ class MainWindow(QMainWindow):
             self.events.status.emit(f"全局快捷键启用失败：{exc}")
 
     def _hotkey_record_toggle(self):
-        if self.recorder.stream is None:
-            self._start_live()
-        else:
-            self._stop_live()
+        self._toggle_live()
 
     def _refresh_history(self):
         if not hasattr(self, "history_table"):
@@ -1430,14 +1603,24 @@ class MainWindow(QMainWindow):
 
     def _model_ready(self):
         live_backend = SETTINGS.get("live", "backend", "faster_whisper")
-        streaming_ready = live_backend == "qwen3_asr" and self.streaming_service.ready
-        manager_ready = self.manager.backend_key and self.manager.backend_key[0] == live_backend
+        recognition_mode = SETTINGS.get("live", "recognition_mode", "streaming")
+        streaming_ready = recognition_mode == "streaming" and self.streaming_service.ready
+        manager_ready = (
+            recognition_mode == "standard"
+            and self.manager.backend_key
+            and self.manager.backend_key[0] == live_backend
+        )
         if streaming_ready or manager_ready:
             label = BACKEND_INFO.get(live_backend, {}).get("label", live_backend)
+            mode_label = (
+                "真流式"
+                if SETTINGS.get("live", "recognition_mode", "streaming") == "streaming"
+                else "普通分段"
+            )
             self.model_is_ready = True
-            self.live_model_state.setText(f"● {label} 已就绪")
+            self.live_model_state.setText(f"● {mode_label} · {label} 已就绪")
             self.live_model_state.setStyleSheet("color:#6fdaa0;font-weight:600;")
-            if self.recorder.stream is None:
+            if self.recorder.stream is None and not self.live_starting and not self.live_stopping:
                 self.start_button.setEnabled(True)
             self.status_label.clear()
 
@@ -1455,15 +1638,26 @@ class MainWindow(QMainWindow):
         self.output_path_label.setText(f"默认输出：{FILE_OUTPUT_DIR}")
         self.recorder.chunk_seconds = float(SETTINGS.get("live", "chunk_seconds", 3.5))
         self.recorder.silence_threshold = float(SETTINGS.get("live", "silence_threshold", 0.0025))
+        self.streaming_service.chunk_seconds = float(SETTINGS.get("live", "stream_chunk_seconds", 0.8))
+        self.streaming_service.unfixed_chunk_num = int(
+            SETTINGS.get("live", "stream_unfixed_chunk_num", 4)
+        )
+        self.streaming_service.unfixed_token_num = int(
+            SETTINGS.get("live", "stream_unfixed_token_num", 5)
+        )
         self._refresh_devices()
         self._start_hotkeys()
         live_backend = SETTINGS.get("live", "backend", "faster_whisper")
-        if live_backend != "qwen3_asr" and self.streaming_service.ready:
-            self.streaming_service.stop_engine()
+        recognition_mode = SETTINGS.get("live", "recognition_mode", "streaming")
         default_path = BACKEND_INFO.get(live_backend, {}).get("default_path", "")
         model_path = SETTINGS.get("model", f"{live_backend}_path", default_path)
-        streaming_ready = live_backend == "qwen3_asr" and self.streaming_service.ready
-        if streaming_ready or self.manager.backend_key == (live_backend, model_path):
+        streaming_ready = recognition_mode == "streaming" and self.streaming_service.ready
+        manager_ready = recognition_mode == "standard" and self.manager.backend_key == (live_backend, model_path)
+        if streaming_ready or manager_ready:
+            if streaming_ready and self.manager.backend is not None:
+                threading.Thread(target=self.manager.unload, daemon=True).start()
+            if manager_ready and self.streaming_service.ready:
+                threading.Thread(target=self.streaming_service.stop, daemon=True).start()
             self._model_ready()
         else:
             self.model_is_ready = False
@@ -1476,12 +1670,17 @@ class MainWindow(QMainWindow):
     def _warm_model(self):
         try:
             live_backend = SETTINGS.get("live", "backend", "faster_whisper")
-            if live_backend == "qwen3_asr":
+            recognition_mode = SETTINGS.get("live", "recognition_mode", "streaming")
+            if recognition_mode == "streaming":
+                if self.manager.backend is not None:
+                    self.manager.unload()
                 self.events.status.emit("正在启动 Qwen3-ASR 1.7B 流式服务…")
                 self.streaming_service.ensure_started()
                 self.events.status.emit("Qwen3-ASR 1.7B 流式服务已就绪 · 全程本地")
                 self.events.model_ready.emit()
             else:
+                if self.streaming_service.ready or self.streaming_service.keepalive is not None:
+                    self.streaming_service.stop()
                 self.manager.ensure_loaded(live_backend)
         except Exception as exc:
             self.events.error.emit(f"模型加载失败：{exc}")
@@ -1518,23 +1717,83 @@ class MainWindow(QMainWindow):
         if pos < 0:
             self._show_error("没有可用的音频输入设备。")
             return
-        try:
-            self._clear_live()
-            self.recorder.start(self.device_indices[pos])
-            self.start_button.setEnabled(False)
-            self.start_button.setText("停止并保存")
-            self.start_button.setObjectName("stopButton")
-            self.start_button.style().unpolish(self.start_button)
-            self.start_button.style().polish(self.start_button)
-            self.start_button.setEnabled(True)
-            self.live_model_state.setText("● 正在录制并识别")
-            self.live_model_state.setStyleSheet("color:#67a9ff;font-weight:600;")
-            self.record_time.show()
-        except Exception as exc:
-            self._show_error(f"无法启动音频输入：{exc}")
+        if self.live_starting or self.live_stopping:
+            return
+        self._clear_live()
+        self.live_starting = True
+        self.start_button.setEnabled(False)
+        self.start_button.setText("正在启动…")
+        self.live_model_state.setText("● 正在建立录制会话…")
+        self.live_model_state.setStyleSheet("color:#f6c85f;font-weight:600;")
+        device_index = self.device_indices[pos]
+
+        def start_worker():
+            try:
+                self.recorder.start(device_index)
+            except Exception as exc:
+                LOGGER.exception("无法启动实时录制")
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    LOGGER.exception("实时录制启动失败后的清理失败")
+                if SETTINGS.get("live", "release_model_after_stop", False):
+                    self.streaming_service.stop()
+                    self.manager.unload()
+                self.events.live_start_failed.emit(str(exc))
+                return
+            self.events.live_started.emit()
+
+        threading.Thread(target=start_worker, name="live-start", daemon=True).start()
+
+    def _live_started(self):
+        self.live_starting = False
+        self.start_button.setText("停止并保存")
+        self.start_button.setObjectName("stopButton")
+        self.start_button.style().unpolish(self.start_button)
+        self.start_button.style().polish(self.start_button)
+        self.start_button.setEnabled(True)
+        mode_label = "真流式" if self.recorder.recognition_mode == "streaming" else "普通分段"
+        self.live_model_state.setText(f"● {mode_label}录制中 · 正在识别")
+        self.live_model_state.setStyleSheet("color:#67a9ff;font-weight:600;")
+        self.record_time.show()
+
+    def _live_start_failed(self, message):
+        self.live_starting = False
+        self.start_button.setText("开始录制")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.style().unpolish(self.start_button)
+        self.start_button.style().polish(self.start_button)
+        self.start_button.setEnabled(True)
+        self.live_model_state.setText("● 启动失败 · 可在设置中切换普通分段模式")
+        self.live_model_state.setStyleSheet("color:#ff7d88;font-weight:600;")
+        self._show_error(f"无法启动音频输入：{message}")
 
     def _stop_live(self):
-        self.recorder.stop()
+        if self.live_starting or self.live_stopping:
+            return
+        self.live_stopping = True
+        self.start_button.setEnabled(False)
+        self.start_button.setText("正在停止…")
+        self.live_model_state.setText("● 正在保存并释放资源…")
+        self.live_model_state.setStyleSheet("color:#f6c85f;font-weight:600;")
+
+        def stop_worker():
+            released = SETTINGS.get("live", "release_model_after_stop", False)
+            try:
+                self.recorder.stop()
+                if released:
+                    self.streaming_service.stop()
+                    self.manager.unload()
+            except Exception as exc:
+                LOGGER.exception("无法停止实时录制")
+                self.events.live_stop_failed.emit(str(exc))
+                return
+            self.events.live_stopped.emit(bool(released))
+
+        threading.Thread(target=stop_worker, name="live-stop", daemon=True).start()
+
+    def _live_stopped(self, released):
+        self.live_stopping = False
         self.start_button.setEnabled(True)
         self.start_button.setText("开始录制")
         self.start_button.setObjectName("primaryButton")
@@ -1542,10 +1801,29 @@ class MainWindow(QMainWindow):
         self.start_button.style().polish(self.start_button)
         self.audio_meter.setValue(0)
         self.record_time.hide()
-        self._model_ready()
-        self.status_label.setText("实时字幕已停止；已自动保存文本。")
+        if released:
+            self.model_is_ready = False
+            self.live_model_state.setText("● 模型已释放 · 再次录制时自动加载")
+            self.live_model_state.setStyleSheet("color:#9aa6b6;font-weight:600;")
+            self.status_label.setText("录制已保存；模型内存和显存已释放。")
+        else:
+            self._model_ready()
+            self.status_label.setText("录制已保存；模型保持就绪。")
+
+    def _live_stop_failed(self, message):
+        self.live_stopping = False
+        self.start_button.setEnabled(True)
+        self.start_button.setText("开始录制")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.style().unpolish(self.start_button)
+        self.start_button.style().polish(self.start_button)
+        self.live_model_state.setText("● 停止录制时发生错误")
+        self.live_model_state.setStyleSheet("color:#ff7d88;font-weight:600;")
+        self._show_error(f"停止录制失败：{message}")
 
     def _toggle_live(self):
+        if self.live_starting or self.live_stopping:
+            return
         if self.recorder.stream is None:
             self._start_live()
         else:
@@ -1560,19 +1838,13 @@ class MainWindow(QMainWindow):
 
     def _append_live(self, text):
         self.caption_stack.setCurrentIndex(1)
-        self.live_edit.append(text)
+        update_caption_widget(self.live_edit, text, append=True)
         self.floating.append_text(text)
-        cursor = self.live_edit.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.live_edit.setTextCursor(cursor)
 
     def _replace_live(self, text):
         self.caption_stack.setCurrentIndex(1)
-        self.live_edit.setPlainText(text)
+        update_caption_widget(self.live_edit, text)
         self.floating.set_text(text)
-        cursor = self.live_edit.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.live_edit.setTextCursor(cursor)
 
     def _clear_live(self):
         self.live_edit.clear()

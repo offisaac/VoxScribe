@@ -1,7 +1,26 @@
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
+
+
+_SIMPLIFIER = None
+_SIMPLIFIER_LOCK = threading.Lock()
+
+
+def normalize_recognition_text(text):
+    text = (text or "").strip()
+    if not text:
+        return ""
+    global _SIMPLIFIER
+    if _SIMPLIFIER is None:
+        with _SIMPLIFIER_LOCK:
+            if _SIMPLIFIER is None:
+                from opencc import OpenCC
+
+                _SIMPLIFIER = OpenCC("t2s")
+    return _SIMPLIFIER.convert(text)
 
 
 @dataclass
@@ -18,6 +37,10 @@ class TranscriptionResult:
     segments: list[Segment]
     language: str = ""
     duration: float = 0.0
+
+    def __post_init__(self):
+        for segment in self.segments:
+            segment.text = normalize_recognition_text(segment.text)
 
     @property
     def text(self):

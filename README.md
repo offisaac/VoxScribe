@@ -86,10 +86,16 @@ The bundled service definition expects a prepared WSL environment with the servi
 ```bash
 sudo cp scripts/voxscribe-qwen-stream.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now voxscribe-qwen-stream
+sudo systemctl disable voxscribe-qwen-stream
 ```
 
-In VoxScribe settings, select **Qwen3-ASR 1.7B** as the live model. The app checks the local service and starts it through the configured WSL distribution when necessary. `streaming_url` and `wsl_distro` can be changed in `config/settings.json`.
+In VoxScribe settings, select **Qwen3-ASR 1.7B** as the live model. The app checks the local service and starts it through the configured WSL distribution when necessary. It keeps the model loaded while VoxScribe is open and shuts WSL down when VoxScribe exits. `streaming_url` and `wsl_distro` can be changed in `config/settings.json`.
+
+The bundled service is tuned for one live transcription session: a single-process vLLM engine, eager CUDA execution, no CPU swap reservation, an 8K context, a 55% GPU memory target, and no multimodal processor cache. The processor cache is intentionally disabled because live audio chunks are unique and do not benefit from reuse. These defaults prioritize low Windows RAM use over maximum batch throughput.
+
+Live recording exposes two independent Qwen modes. **True streaming** uses the WSL service for low-latency revisions. **Standard segmented** loads the same Qwen3-ASR 1.7B model directly on Windows and does not depend on the WSL streaming session. Standard Qwen is the default fallback when streaming startup fails. Switching modes unloads the previous runtime before loading the new one so both model copies are not kept in RAM together.
+
+Recognition is scoped to Simplified Chinese and English. The language selector supports automatic Chinese/English detection, forced Simplified Chinese, or forced English. Translation is disabled, and all recognized Chinese text is normalized to Simplified Chinese before display and export.
 
 ### Fun-ASR-Nano fast mode
 
