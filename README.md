@@ -15,6 +15,10 @@ VoxScribe is a Windows desktop app for real-time captions and offline media tran
 - Optional noise reduction, vocal isolation, speaker clustering, and global hotkeys.
 - OBS-ready text output that always contains the newest live caption.
 
+## Built with Codex & GPT-5.6
+
+VoxScribe was developed with Codex and GPT-5.6 as collaborative engineering tools. They were used to shape the local-first product workflow, implement the Windows desktop interface and model-adapter architecture, refine audio-routing and presenter-caption interactions, create the test suite, and document a reproducible open-source setup. The final application runs transcription locally with user-controlled models and audio devices; Codex and GPT-5.6 supported the development process rather than acting as a runtime dependency.
+
 ## Architecture
 
 ```text
