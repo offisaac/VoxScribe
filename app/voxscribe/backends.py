@@ -17,6 +17,10 @@ BACKEND_INFO = {
         "label": "Faster Whisper Large-V3",
         "default_path": str(ROOT / "models" / "faster-whisper-large-v3"),
     },
+    "fun_asr_nano": {
+        "label": "Fun-ASR-Nano 高速模式",
+        "default_path": str(ROOT / "models" / "Fun-ASR-Nano-2512"),
+    },
     "external_cli": {
         "label": "通用本地命令行模型",
         "default_path": "",
@@ -115,6 +119,77 @@ class FasterWhisperBackend:
         return self.transcribe_result(audio, language).text
 
 
+class FunASRNanoBackend:
+    label = BACKEND_INFO["fun_asr_nano"]["label"]
+
+    def __init__(self, model_path):
+        import torch
+        from funasr import AutoModel
+
+        self.model = AutoModel(
+            model=str(model_path),
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            disable_update=True,
+            trust_remote_code=True,
+        )
+
+    def transcribe_result(self, audio, language=None):
+        import os
+        import tempfile
+
+        import soundfile as sf
+
+        samples, sample_rate = normalize_audio(audio)
+        temporary_path = None
+        if isinstance(audio, tuple):
+            cache_dir = ROOT / "cache" / "live-audio"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            handle = tempfile.NamedTemporaryFile(suffix=".wav", dir=cache_dir, delete=False)
+            temporary_path = handle.name
+            handle.close()
+            sf.write(temporary_path, samples, sample_rate)
+            model_input = temporary_path
+        else:
+            model_input = str(audio)
+        language_map = {"Chinese": "中文", "English": "英文"}
+        try:
+            results = self.model.generate(
+                input=model_input,
+                audio_fs=sample_rate,
+                language=language_map.get(language, "auto"),
+                disable_pbar=True,
+                disable_log=True,
+            )
+        finally:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+        item = results[0] if results else {}
+        text = (item.get("text") or item.get("text_tn") or "").strip()
+        timestamps = item.get("timestamps") or item.get("ctc_timestamps") or []
+        words = [
+            {
+                "start": float(stamp.get("start_time", 0.0)),
+                "end": float(stamp.get("end_time", 0.0)),
+                "word": str(stamp.get("token", "")),
+            }
+            for stamp in timestamps
+            if stamp.get("token")
+        ]
+        duration = len(samples) / sample_rate
+        segments = [Segment(0.0, duration, text, words=words)] if text else []
+        return TranscriptionResult(
+            segments=segments,
+            language=language or "",
+            duration=duration,
+        )
+
+    def transcribe(self, audio, language=None):
+        return self.transcribe_result(audio, language).text
+
+
 class ExternalCLIBackend:
     label = BACKEND_INFO["external_cli"]["label"]
 
@@ -186,6 +261,8 @@ def create_backend(name, model_path, options=None):
         return QwenBackend(model_path)
     if name == "faster_whisper":
         return FasterWhisperBackend(model_path)
+    if name == "fun_asr_nano":
+        return FunASRNanoBackend(model_path)
     if name == "external_cli":
         return ExternalCLIBackend(model_path, options.get("command_template", ""))
     raise RuntimeError(f"尚未安装模型适配器：{name}")

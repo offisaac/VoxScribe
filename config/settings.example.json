@@ -7,6 +7,9 @@
   "live": {
     "device_keyword": "CABLE Output",
     "backend": "faster_whisper",
+    "streaming_url": "http://127.0.0.1:8765",
+    "wsl_distro": "Ubuntu",
+    "stream_chunk_seconds": 0.8,
     "export_enabled": true,
     "export_folder": "C:\\VoxScribe\\transcripts",
     "file_name": "Meeting Transcript {date_time}",

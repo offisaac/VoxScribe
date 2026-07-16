@@ -6,9 +6,10 @@ import pytest
 import soundfile as sf
 from PySide6.QtWidgets import QApplication
 
-from voxscribe.backends import _speech_intervals
+from voxscribe.backends import FunASRNanoBackend, _speech_intervals
 from voxscribe.config import SettingsStore
 from voxscribe.exports import write_exports
+from voxscribe.streaming import QwenStreamingSession
 from voxscribe.tasks import TaskStore
 from voxscribe.transcription import Segment, TranscriptionResult
 from voxscribe.viewer import TranscriptionViewer
@@ -91,6 +92,22 @@ def test_vad_intervals_follow_speech():
     assert 1.9 * sample_rate < end < 2.3 * sample_rate
 
 
+def test_fun_asr_result_mapping():
+    class FakeModel:
+        def generate(self, **kwargs):
+            assert kwargs["language"] == "中文"
+            self.input_path = Path(kwargs["input"])
+            assert self.input_path.exists()
+            return [{"text": "高速字幕。", "timestamps": [{"token": "高", "start_time": 0.1, "end_time": 0.2}]}]
+
+    backend = FunASRNanoBackend.__new__(FunASRNanoBackend)
+    backend.model = FakeModel()
+    result = backend.transcribe_result((np.zeros(16000, dtype=np.float32), 16000), "Chinese")
+    assert result.text == "高速字幕。"
+    assert result.segments[0].words[0] == {"start": 0.1, "end": 0.2, "word": "高"}
+    assert not backend.model.input_path.exists()
+
+
 def test_viewer_constructs_from_persisted_result(tmp_path, app):
     source = tmp_path / "viewer.wav"
     sf.write(source, np.zeros(16000, dtype=np.float32), 16000)
@@ -102,3 +119,45 @@ def test_viewer_constructs_from_persisted_result(tmp_path, app):
     assert viewer.table.rowCount() == 1
     assert viewer.table.item(0, 3).text() == "可编辑文本"
     viewer.close()
+
+
+def test_qwen_streaming_http_session(monkeypatch):
+    calls = []
+    responses = iter(
+        [
+            {"session_id": "session-1"},
+            {"language": "Chinese", "text": "partial"},
+            {"language": "Chinese", "text": "final"},
+        ]
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, value):
+            self.value = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(self.value).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request.full_url, request.data, request.headers, timeout))
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr("voxscribe.streaming.urlopen", fake_urlopen)
+    session = QwenStreamingSession("http://127.0.0.1:8765").start()
+    partial = session.push(np.zeros(16000, dtype=np.float32))
+    final = session.finish()
+
+    assert partial["text"] == "partial"
+    assert final["text"] == "final"
+    assert calls[0][0].endswith("/api/start")
+    assert calls[1][0].endswith("/api/chunk?session_id=session-1")
+    assert len(calls[1][1]) == 16000 * 4
+    assert calls[2][0].endswith("/api/finish?session_id=session-1")

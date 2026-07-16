@@ -7,9 +7,11 @@ VoxScribe is a Windows desktop app for real-time captions and offline media tran
 ## Features
 
 - Real-time recording from Windows audio devices, including VB-CABLE.
+- Local Qwen3-ASR streaming captions through a WSL 2 service, with partial results that update as speech arrives.
+- Fun-ASR-Nano as an optional low-latency local live-caption backend.
 - Floating, always-on-top caption window for presentations.
 - Offline audio/video transcription and automatic folder monitoring.
-- Faster Whisper and Qwen3-ASR local backends, plus an external CLI adapter.
+- Faster Whisper, Qwen3-ASR, Fun-ASR-Nano, and an external CLI adapter for local backends.
 - TXT, SRT, VTT, and JSON transcript exports.
 - Task history, retries, cancellation, transcript viewer, search, editing, and media playback.
 - Optional noise reduction, vocal isolation, speaker clustering, and global hotkeys.
@@ -35,6 +37,7 @@ VoxScribe reads audio for transcription only. Keep the meeting application's mic
 - NVIDIA GPU with CUDA recommended for local models
 - FFmpeg available on `PATH` for broad media-format support
 - Local model weights for Qwen3-ASR and/or Faster Whisper (not included in this repository)
+- WSL 2 with an Ubuntu distribution and systemd, only when using Qwen3-ASR streaming mode
 
 ## Setup
 
@@ -58,6 +61,39 @@ Run the test suite with:
 ```powershell
 python -m pytest tests
 ```
+
+## Live transcription modes
+
+VoxScribe offers two local live-caption approaches:
+
+| Mode | Backend | Best for |
+| --- | --- | --- |
+| Standard live captions | Faster Whisper or Fun-ASR-Nano | Low-latency chunked captions directly on Windows |
+| Streaming live captions | Qwen3-ASR 1.7B | Continuously updated captions with local WSL 2 inference |
+
+### Qwen3-ASR streaming mode
+
+Qwen streaming is fully local. The Windows app sends 16 kHz audio chunks only to a service on `http://127.0.0.1:8765`; no cloud endpoint or API key is used.
+
+The checked-in streaming components are:
+
+- `app/voxscribe/streaming.py` — Windows client and session lifecycle.
+- `scripts/qwen_stream_server.py` — local Qwen streaming HTTP service.
+- `scripts/voxscribe-qwen-stream.service` — systemd service definition for WSL 2.
+
+The bundled service definition expects a prepared WSL environment with the service script at `/opt/voxscribe/services/qwen_stream_server.py`, the Qwen model at `/opt/voxscribe/models/Qwen3-ASR-1.7B`, and a Python runtime at `/opt/voxscribe/runtime/bin/python`. Update those paths if your WSL installation differs, then install and start the service:
+
+```bash
+sudo cp scripts/voxscribe-qwen-stream.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now voxscribe-qwen-stream
+```
+
+In VoxScribe settings, select **Qwen3-ASR 1.7B** as the live model. The app checks the local service and starts it through the configured WSL distribution when necessary. `streaming_url` and `wsl_distro` can be changed in `config/settings.json`.
+
+### Fun-ASR-Nano fast mode
+
+Set the live backend to `fun_asr_nano` and place its local model under the configured `fun_asr_nano_path`. VoxScribe uses short audio chunks in this mode to prioritize responsiveness. It does not require WSL.
 
 ## Privacy
 

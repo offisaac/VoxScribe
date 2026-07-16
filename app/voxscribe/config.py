@@ -15,6 +15,9 @@ DEFAULT_SETTINGS = {
     "live": {
         "device_keyword": "CABLE Output",
         "backend": "faster_whisper",
+        "streaming_url": "http://127.0.0.1:8765",
+        "wsl_distro": "Ubuntu",
+        "stream_chunk_seconds": 0.8,
         "export_enabled": True,
         "export_folder": r"D:\Meeting-Transcripts\Voxscribe",
         "file_name": "Meeting Transcript {date_time}",
@@ -41,6 +44,7 @@ DEFAULT_SETTINGS = {
         "model_path": str(ROOT / "models" / "Qwen3-ASR-1.7B"),
         "qwen3_asr_path": str(ROOT / "models" / "Qwen3-ASR-1.7B"),
         "faster_whisper_path": str(ROOT / "models" / "faster-whisper-large-v3"),
+        "fun_asr_nano_path": str(ROOT / "models" / "Fun-ASR-Nano-2512"),
         "external_cli_path": "",
         "external_cli_command": "",
         "language": "auto",
