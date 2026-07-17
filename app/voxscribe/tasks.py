@@ -68,8 +68,17 @@ class TaskStore:
         now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as connection:
             connection.execute(
-                "UPDATE tasks SET status='running', error='', updated_at=? WHERE id=?",
+                "UPDATE tasks SET status='running', progress=1, notes='准备处理', error='', updated_at=? WHERE id=?",
                 (now, int(task_id)),
+            )
+
+    def update_progress(self, task_id, progress, notes=""):
+        now = datetime.now().isoformat(timespec="seconds")
+        progress = max(0.0, min(100.0, float(progress)))
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET progress=?, notes=?, updated_at=? WHERE id=? AND status IN ('queued', 'running')",
+                (progress, str(notes), now, int(task_id)),
             )
 
     def complete(self, task_id, output_paths, result=None):
@@ -78,7 +87,7 @@ class TaskStore:
         with self._connect() as connection:
             result_json = result.to_json() if result is not None else ""
             connection.execute(
-                "UPDATE tasks SET status='completed', progress=100, output_paths=?, result_json=?, updated_at=? WHERE id=?",
+                "UPDATE tasks SET status='completed', progress=100, notes='完成', output_paths=?, result_json=?, updated_at=? WHERE id=?",
                 (outputs, result_json, now, task_id),
             )
 

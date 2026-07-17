@@ -10,13 +10,19 @@ _demucs_model = None
 _demucs_lock = threading.Lock()
 
 
-def preprocess_audio(source, mode="off", demucs_model="htdemucs"):
+def preprocess_audio(source, mode="off", demucs_model="htdemucs", progress_callback=None):
+    def report(progress, message):
+        if progress_callback is not None:
+            progress_callback(progress, message)
+
     if mode == "off":
         return str(source)
     if mode == "noise_reduce":
         import noisereduce as nr
 
+        report(8, "读取音频")
         audio, sample_rate = load_media_audio(source, 16000)
+        report(15, "智能降噪")
         enhanced = nr.reduce_noise(
             y=audio,
             sr=sample_rate,
@@ -24,9 +30,13 @@ def preprocess_audio(source, mode="off", demucs_model="htdemucs"):
             prop_decrease=0.8,
             n_jobs=1,
         )
+        report(35, "智能降噪完成")
         return np.asarray(enhanced, dtype=np.float32), sample_rate
     if mode == "vocals":
-        return _extract_vocals(source, demucs_model)
+        report(8, "读取音频")
+        result = _extract_vocals(source, demucs_model)
+        report(35, "人声分离完成")
+        return result
     raise RuntimeError(f"未知音频预处理模式：{mode}")
 
 
@@ -60,4 +70,3 @@ def _extract_vocals(source, model_name):
     if model.samplerate != 16000:
         vocals = resample_poly(vocals, 16000, model.samplerate)
     return np.asarray(vocals, dtype=np.float32), 16000
-

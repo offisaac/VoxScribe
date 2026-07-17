@@ -2,6 +2,23 @@
 
 All notable changes to VoxScribe are documented in this file.
 
+## 0.6.0 — 2026-07-17
+
+### Added
+
+- Stage-aware offline task progress for audio preprocessing, recognition, speaker identification, transcript export, and completion.
+- Current progress percentage and status note in Task History for queued and running file jobs.
+
+### Changed
+
+- Noise reduction and local vocal isolation report their progress through the shared file-task pipeline.
+- Completed tasks now retain a concise completion note alongside their exported output paths.
+
+### Fixed
+
+- VoxScribe verifies requested export files exist before marking a transcription task complete.
+- System-audio loopback recording is now treated as an active recording session, so folder monitoring and file transcription correctly pause while live captions are running.
+
 ## 0.5.0 — 2026-07-17
 
 ### Added

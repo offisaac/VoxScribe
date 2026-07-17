@@ -752,6 +752,12 @@ class LiveRecorder:
         self.audio_block_seconds = 0.1
         self.streaming_session = None
 
+    @property
+    def is_active(self):
+        return self.stream is not None or (
+            self.capture_thread is not None and self.capture_thread.is_alive()
+        )
+
     def start(self, device_source):
         self.stop()
         while True:
@@ -1115,6 +1121,11 @@ class FileTaskQueue:
         self.tasks.cancel(task_id)
         self.events.history_changed.emit()
 
+    def _set_progress(self, task_id, progress, message):
+        self.tasks.update_progress(task_id, progress, message)
+        self.events.history_changed.emit()
+        self.events.status.emit(f"{int(progress)}% · {message}")
+
     def stop(self):
         self.stop_event.set()
         self.pending.put(None)
@@ -1146,7 +1157,11 @@ class FileTaskQueue:
                         source,
                         processing_mode,
                         SETTINGS.get("audio_processing", "demucs_model", "htdemucs"),
+                        lambda progress, message: self._set_progress(task_id, progress, message),
                     )
+                else:
+                    self._set_progress(task_id, 35, "已跳过音频预处理")
+                self._set_progress(task_id, 40, "正在识别")
                 live_backend = SETTINGS.get("live", "backend", "faster_whisper")
                 if backend_name == "qwen3_asr":
                     result = self.streaming_service.transcribe_result(audio_input)
@@ -1158,17 +1173,23 @@ class FileTaskQueue:
                         language=None if language == "auto" else language,
                         backend_name=backend_name,
                     )
+                self._set_progress(task_id, 88, "识别完成")
                 if SETTINGS.get("audio_processing", "speaker_identification", False):
                     from voxscribe.diarization import assign_speakers
 
+                    self._set_progress(task_id, 90, "正在识别说话人")
                     self.events.status.emit(f"正在识别说话人：{source.name}")
                     result = assign_speakers(
                         result,
                         audio_input,
                         SETTINGS.get("audio_processing", "speaker_count", 0),
                     )
+                self._set_progress(task_id, 96, "正在导出文件")
                 formats = SETTINGS.get("folder_watch", "export_formats", ["txt"])
                 outputs = write_transcript_exports(result, source, FILE_OUTPUT_DIR, formats, backend_name)
+                missing_outputs = [path for path in outputs if not Path(path).is_file()]
+                if not outputs or missing_outputs:
+                    raise RuntimeError("转写结果未成功写入输出文件夹")
                 live_backend = SETTINGS.get("live", "backend", "faster_whisper")
                 if live_backend == "qwen3_asr" and backend_name != "qwen3_asr":
                     self.manager.unload()
@@ -1377,12 +1398,12 @@ class MainWindow(QMainWindow):
             self.streaming_service,
             self.events,
             self.tasks,
-            lambda: self.recorder.stream is not None,
+            lambda: self.recorder.is_active,
         )
         self.folder_watcher = FolderWatcher(
             self.file_queue,
             self.events,
-            lambda: self.recorder.stream is not None,
+            lambda: self.recorder.is_active,
         )
         self.hotkeys = HotkeyManager(
             self.events.record_hotkey.emit,
@@ -1675,7 +1696,7 @@ class MainWindow(QMainWindow):
         self.history_table.setColumnWidth(1, 210)
         self.history_table.setColumnWidth(2, 90)
         self.history_table.setColumnWidth(3, 160)
-        self.history_table.setColumnWidth(4, 80)
+        self.history_table.setColumnWidth(4, 110)
         self.history_table.cellDoubleClicked.connect(self._open_history_item)
         layout.addWidget(self.history_table, 1)
         self._refresh_history()
@@ -1733,13 +1754,21 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(1, f"文件转写  {active_count}" if active_count else "文件转写")
         for row_index, row in enumerate(rows):
             backend_label = BACKEND_INFO.get(row["backend"], {}).get("label", row["backend"])
-            detail = row["output_paths"] if row["status"] == "completed" else row["error"]
+            if row["status"] == "completed":
+                detail = row["output_paths"]
+            elif row["status"] in {"queued", "running"}:
+                detail = row["notes"]
+            else:
+                detail = row["error"]
+            status_text = status_labels.get(row["status"], row["status"])
+            if row["status"] == "running":
+                status_text = f"{status_text} {int(row['progress'])}%"
             values = [
                 row["updated_at"].replace("T", " "),
                 row["source_name"],
                 trigger_labels.get(row["trigger"], row["trigger"]),
                 backend_label,
-                status_labels.get(row["status"], row["status"]),
+                status_text,
                 detail,
             ]
             for column, value in enumerate(values):
@@ -1794,7 +1823,7 @@ class MainWindow(QMainWindow):
             self.model_is_ready = True
             self.live_model_state.setText(f"● {mode_label} · {label} 已就绪")
             self.live_model_state.setStyleSheet("color:#6fdaa0;font-weight:600;")
-            if self.recorder.stream is None and not self.live_starting and not self.live_stopping:
+            if not self.recorder.is_active and not self.live_starting and not self.live_stopping:
                 self.start_button.setEnabled(True)
             self.status_label.clear()
 
@@ -2049,15 +2078,15 @@ class MainWindow(QMainWindow):
     def _toggle_live(self):
         if self.live_starting or self.live_stopping:
             return
-        if self.recorder.stream is None:
-            self._start_live()
-        else:
+        if self.recorder.is_active:
             self._stop_live()
+        else:
+            self._start_live()
 
     def _update_audio_meter(self, rms):
         level = max(0, min(100, int(rms * 900)))
         self.audio_meter.setValue(level)
-        if self.recorder.stream is not None:
+        if self.recorder.is_active:
             elapsed = max(0, int(time.monotonic() - self.recorder.session_started))
             self.record_time.setText(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
 

@@ -123,6 +123,12 @@ System loopback capture is local and read-only. It captures playback audio only;
 
 VoxScribe offers selectable local Demucs models for vocal isolation: balanced **HTDemucs**, higher-quality **HTDemucs FT**, six-source **HTDemucs 6S**, and faster **MDX** variants. The selected model is downloaded by Demucs on first use if it is not already cached. For normal meetings, start with noise reduction or HTDemucs; reserve larger separation models for offline media where processing time is less important.
 
+## Offline task progress and safety
+
+File and folder-monitor transcription tasks now report their current stage in **Task History**: preparing, audio preprocessing, recognition, speaker identification, export, and completion. Running tasks show an estimated stage percentage and the current status note instead of an empty result field.
+
+VoxScribe verifies that each requested transcript export exists before marking a task as complete. If an output file cannot be written, the task remains failed rather than being presented as a successful transcription. Folder monitoring and file processing pause whenever either a normal input stream or system-audio loopback recording is active, preventing the two workloads from competing for the active model.
+
 ## Privacy
 
 VoxScribe is designed for local operation. Model weights, recordings, transcripts, task history, logs, and user settings are intentionally excluded from version control.

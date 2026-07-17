@@ -66,6 +66,10 @@ def test_task_store_lifecycle(tmp_path):
     interrupted_queued = store.enqueue(source, "folder", "qwen3_asr")
     running = store.start(source, "manual", "qwen3_asr")
     assert store.get(running)["status"] == "running"
+    assert store.get(running)["progress"] == 1
+    store.update_progress(running, 35, "智能降噪完成")
+    assert store.get(running)["progress"] == 35
+    assert store.get(running)["notes"] == "智能降噪完成"
     assert store.recover_interrupted() == 2
     assert store.get(interrupted_queued)["status"] == "failed"
     assert store.get(running)["status"] == "failed"
@@ -258,6 +262,24 @@ def test_wdm_ks_capture_prefers_48khz():
     assert desktop.capture_sample_rate_candidates(
         {"default_samplerate": 44100.0}, "Windows WASAPI"
     ) == [44100, 48000]
+
+
+def test_live_recorder_reports_system_loopback_thread_as_active():
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_live_state_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+
+    class FakeThread:
+        def is_alive(self):
+            return True
+
+    recorder = desktop.LiveRecorder.__new__(desktop.LiveRecorder)
+    recorder.stream = None
+    recorder.capture_thread = FakeThread()
+    assert recorder.is_active is True
+    recorder.capture_thread = None
+    assert recorder.is_active is False
 
 
 def test_error_dialog_is_non_modal_and_reuses_single_window(app):
