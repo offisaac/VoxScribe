@@ -144,6 +144,7 @@ def write_transcript_exports(result, source, output_dir, formats, backend_name=N
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+import soundcard as sc
 from PySide6.QtCore import QEvent, QLockFile, QObject, QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon
 from PySide6.QtWidgets import (
@@ -162,6 +163,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QProgressBar,
@@ -189,6 +191,62 @@ def update_caption_widget(widget, text, append=False):
         scroll.setValue(scroll.maximum())
     else:
         scroll.setValue(min(previous_value, scroll.maximum()))
+
+
+QUICK_AUDIO_SOURCES = {
+    "meeting": ("CABLE Output", "Windows WASAPI"),
+    "testing": ("电脑音频", "Windows WASAPI loopback"),
+}
+
+
+def find_audio_device(candidates, name_keyword, api_name):
+    for position, (_, _, api, name) in enumerate(candidates):
+        if name_keyword.lower() in name.lower() and api == api_name:
+            return position
+    return None
+
+
+def capture_sample_rate_candidates(device, api_name):
+    default_rate = int(device["default_samplerate"])
+    rates = [48000, default_rate, 44100] if api_name == "Windows WDM-KS" else [default_rate, 48000, 44100]
+    return list(dict.fromkeys(rate for rate in rates if rate > 0))
+
+
+def select_active_output_loopback(probe_frames=4800):
+    loopbacks = [
+        microphone
+        for microphone in sc.all_microphones(include_loopback=True)
+        if getattr(microphone, "isloopback", False)
+    ]
+    if not loopbacks:
+        raise RuntimeError("Windows 没有提供可用的扬声器回环设备")
+    virtual_markers = ("SteelSeries Sonar", "CABLE", "Steam", "ToDesk", "网易")
+    physical = [
+        microphone
+        for microphone in loopbacks
+        if not any(marker.lower() in microphone.name.lower() for marker in virtual_markers)
+    ]
+    candidates = physical or loopbacks
+    best_microphone = None
+    best_level = -1.0
+    for microphone in candidates:
+        try:
+            with microphone.recorder(samplerate=48000, channels=1, blocksize=probe_frames) as recorder:
+                audio = recorder.record(numframes=probe_frames)
+            level = float(np.sqrt(np.mean(np.square(audio))) if audio.size else 0.0)
+            if level > best_level:
+                best_microphone = microphone
+                best_level = level
+        except Exception:
+            LOGGER.exception("无法探测电脑音频回环：%s", microphone.name)
+    if best_microphone is not None and best_level > 0.0001:
+        return best_microphone
+    for microphone in candidates:
+        if any(marker in microphone.name.lower() for marker in ("耳机", "headphone", "airpods")):
+            return microphone
+    if best_microphone is not None:
+        return best_microphone
+    raise RuntimeError("无法打开电脑当前的扬声器回环")
 
 
 class Events(QObject):
@@ -223,14 +281,18 @@ class SettingsDialog(QDialog):
         self.navigation.setFixedWidth(132)
         self.navigation.setSpacing(3)
         self.navigation.setStyleSheet(
-            "QListWidget{background:#111720;border:0;border-radius:9px;padding:6px;}"
-            "QListWidget::item{padding:11px 12px;border-radius:7px;color:#aab6c6;}"
+            "QListWidget{background:#111720;border:0;border-radius:9px;padding:6px;outline:0;}"
+            "QListWidget::item{padding:11px 12px;border:1px solid transparent;border-radius:7px;color:#aab6c6;outline:0;}"
             "QListWidget::item:hover{background:#1d2633;color:#e8edf5;}"
-            "QListWidget::item:selected{background:#285fae;color:white;font-weight:600;}"
+            "QListWidget::item:selected{background:#285fae;border-color:#3872c2;color:white;font-weight:600;outline:0;}"
+            "QListWidget::item:focus{outline:0;}"
         )
         self.pages = QStackedWidget()
         for page in [self._general_tab(), self._live_tab(), self._folder_tab(), self._audio_tab(), self._model_tab(), self._hotkey_tab()]:
             self.pages.addWidget(page)
+        for combo in self.findChildren(QComboBox):
+            combo.setEditable(False)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.navigation.setCurrentRow(0)
         content.addWidget(self.navigation)
@@ -457,7 +519,20 @@ class SettingsDialog(QDialog):
         if current >= 0:
             self.audio_mode.setCurrentIndex(current)
         form.addRow("转写前处理", self.audio_mode)
-        self.demucs_model = QLineEdit(self.store.get("audio_processing", "demucs_model", "htdemucs"))
+        self.demucs_model = QComboBox()
+        for label, model_name in (
+            ("HTDemucs · 推荐，质量与速度均衡", "htdemucs"),
+            ("HTDemucs FT · 更高质量，速度较慢", "htdemucs_ft"),
+            ("HTDemucs 6S · 六音轨分离，速度较慢", "htdemucs_6s"),
+            ("MDX · 经典模型", "mdx"),
+            ("MDX Extra · 更强分离，速度较慢", "mdx_extra"),
+            ("MDX Extra Q · 轻量快速", "mdx_extra_q"),
+        ):
+            self.demucs_model.addItem(label, model_name)
+        demucs_index = self.demucs_model.findData(
+            self.store.get("audio_processing", "demucs_model", "htdemucs")
+        )
+        self.demucs_model.setCurrentIndex(demucs_index if demucs_index >= 0 else 0)
         form.addRow("Demucs 模型", self.demucs_model)
         self.speaker_identification = QCheckBox("启用本地说话人识别")
         self.speaker_identification.setChecked(
@@ -469,7 +544,7 @@ class SettingsDialog(QDialog):
         self.speaker_count.setValue(self.store.get("audio_processing", "speaker_count", 0))
         self.speaker_count.setSpecialValueText("自动")
         form.addRow("说话人数", self.speaker_count)
-        note = QLabel("智能降噪适合会议和面试；人声分离更强但速度较慢。全部在本机执行。")
+        note = QLabel("智能降噪适合会议和面试；人声分离更强但速度较慢。模型全部在本机运行，未缓存的 Demucs 模型首次使用时需要下载。")
         note.setWordWrap(True)
         note.setObjectName("hintText")
         form.addRow(note)
@@ -559,7 +634,7 @@ class SettingsDialog(QDialog):
             "audio_processing",
             {
                 "mode": self.audio_mode.currentData(),
-                "demucs_model": self.demucs_model.text().strip() or "htdemucs",
+                "demucs_model": self.demucs_model.currentData() or "htdemucs",
                 "speaker_identification": self.speaker_identification.isChecked(),
                 "speaker_count": self.speaker_count.value(),
             },
@@ -654,6 +729,7 @@ class LiveRecorder:
         self.stop_event = threading.Event()
         self.stream = None
         self.thread = None
+        self.capture_thread = None
         self.sample_rate = 48000
         self.recognition_mode = SETTINGS.get("live", "recognition_mode", "streaming")
         backend_name = SETTINGS.get("live", "backend", "faster_whisper")
@@ -676,7 +752,7 @@ class LiveRecorder:
         self.audio_block_seconds = 0.1
         self.streaming_session = None
 
-    def start(self, device_index: int):
+    def start(self, device_source):
         self.stop()
         while True:
             try:
@@ -697,7 +773,22 @@ class LiveRecorder:
         self.silence_threshold = float(SETTINGS.get("live", "silence_threshold", 0.0025))
         self.export_enabled = SETTINGS.get("live", "export_enabled", True)
         self.fixed_obs_file = LIVE_EXPORT_DIR / SETTINGS.get("live", "obs_file_name", "obs_live_caption.txt")
-        self.sample_rate = int(sd.query_devices(device_index)["default_samplerate"])
+        is_system_loopback = (
+            isinstance(device_source, dict) and device_source.get("type") == "system_loopback"
+        )
+        loopback_microphone = None
+        if is_system_loopback:
+            self.events.status.emit("正在检测当前有声音的扬声器回环…")
+            loopback_microphone = select_active_output_loopback()
+            sample_rates = [48000]
+            self.sample_rate = 48000
+            device_name = f"电脑音频 · {loopback_microphone.name}"
+        else:
+            device_info = sd.query_devices(device_source)
+            api_name = sd.query_hostapis(device_info["hostapi"])["name"]
+            sample_rates = capture_sample_rate_candidates(device_info, api_name)
+            self.sample_rate = sample_rates[0]
+            device_name = device_info["name"]
         stamp = datetime.now().strftime("%d-%b-%Y %H-%M-%S")
         template = SETTINGS.get("live", "file_name", "Meeting Transcript {date_time}")
         try:
@@ -739,10 +830,7 @@ class LiveRecorder:
         self.task_id = self.tasks.start(self.session_file, "live", self.backend_name)
         self.events.history_changed.emit()
 
-        def callback(indata, frames, time_info, status):
-            if status:
-                self.events.status.emit(f"音频状态：{status}")
-            mono = np.asarray(indata[:, 0], dtype=np.float32).copy()
+        def handle_audio(mono):
             now = time.monotonic()
             if now - self.last_level_at >= 0.08:
                 self.last_level_at = now
@@ -755,18 +843,63 @@ class LiveRecorder:
                     f"识别暂时落后约 {backlog_seconds:.0f} 秒，正在追赶；音频不会丢失"
                 )
 
-        self.stream = sd.InputStream(
-            device=device_index,
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            callback=callback,
-            blocksize=max(1, int(self.sample_rate * self.audio_block_seconds)),
-        )
-        self.stream.start()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-        self.events.status.emit(f"正在监听 CABLE Output · {self.sample_rate} Hz")
+        if is_system_loopback:
+            frames_per_block = int(self.sample_rate * self.audio_block_seconds)
+
+            def capture_loopback():
+                try:
+                    with loopback_microphone.recorder(
+                        samplerate=self.sample_rate,
+                        channels=1,
+                        blocksize=frames_per_block,
+                    ) as recorder:
+                        while not self.stop_event.is_set():
+                            audio = recorder.record(numframes=frames_per_block)
+                            mono = np.asarray(audio[:, 0], dtype=np.float32).copy()
+                            handle_audio(mono)
+                except Exception as exc:
+                    LOGGER.exception("电脑音频回环录制中断")
+                    self.events.error.emit(f"电脑音频回环中断：{exc}")
+                    self.stop_event.set()
+                    self.audio_queue.put_nowait(None)
+
+            self.capture_thread = threading.Thread(target=capture_loopback, daemon=True)
+            self.capture_thread.start()
+        else:
+            def callback(indata, frames, time_info, status):
+                if status:
+                    self.events.status.emit(f"音频状态：{status}")
+                handle_audio(np.asarray(indata[:, 0], dtype=np.float32).copy())
+
+            last_stream_error = None
+            for sample_rate in sample_rates:
+                stream = None
+                try:
+                    stream = sd.InputStream(
+                        device=device_source,
+                        samplerate=sample_rate,
+                        channels=1,
+                        dtype="float32",
+                        callback=callback,
+                        blocksize=max(1, int(sample_rate * self.audio_block_seconds)),
+                    )
+                    stream.start()
+                    self.stream = stream
+                    self.sample_rate = sample_rate
+                    break
+                except Exception as exc:
+                    last_stream_error = exc
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+            if self.stream is None:
+                self.audio_queue.put_nowait(None)
+                raise last_stream_error or RuntimeError("没有兼容的音频采样率")
+        self.events.status.emit(f"正在监听 {device_name} · {self.sample_rate} Hz")
 
     def stop(self):
         self.stop_event.set()
@@ -777,6 +910,9 @@ class LiveRecorder:
             except Exception:
                 pass
             self.stream = None
+        if self.capture_thread is not None and self.capture_thread is not threading.current_thread():
+            self.capture_thread.join(timeout=2)
+            self.capture_thread = None
         self.audio_queue.put_nowait(None)
         if self.thread is not None and self.thread is not threading.current_thread():
             worker = self.thread
@@ -1257,7 +1393,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         self.setStyleSheet(
-            "QMainWindow{background:#10141c;}"
+            "QMainWindow,QDialog{background:#10141c;}"
             "QWidget{background:transparent;color:#e8edf5;font-family:'Microsoft YaHei UI';}"
             "QFrame#headerCard{background:#161c25;border:0;border-radius:12px;}"
             "QLabel#appTitle{font-size:22px;font-weight:700;color:#ffffff;}"
@@ -1267,16 +1403,25 @@ class MainWindow(QMainWindow):
             "QLabel#hintText{font-size:12px;color:#99a6b8;padding:1px 0 6px 0;}"
             "QLabel#emptyCaptionTitle{font-size:18px;font-weight:600;color:#dce5f1;}"
             "QLabel#emptyCaptionText{font-size:14px;color:#9eabba;}"
-            "QPushButton{background:#232b37;border:1px solid #344052;border-radius:8px;padding:9px 16px;color:#e8edf5;}"
+            "QPushButton{background:#232b37;border:1px solid #344052;border-radius:8px;padding:9px 16px;color:#e8edf5;outline:0;}"
             "QPushButton:hover{background:#2c3645;border-color:#45546a;}"
+            "QPushButton:focus{background:#263140;border-color:#4a8cff;outline:0;}"
             "QPushButton#primaryButton{background:#3978df;border-color:#3978df;font-weight:600;}"
             "QPushButton#primaryButton:hover{background:#4a87e8;border-color:#4a87e8;}"
             "QPushButton#stopButton{background:#6f333a;border-color:#824048;}"
             "QProgressBar{height:6px;background:#202733;border:0;border-radius:3px;text-align:center;color:transparent;}"
             "QProgressBar::chunk{background:#4a8cff;border-radius:3px;}"
             "QPushButton:disabled{background:#1b212b;border-color:#29313e;color:#687485;}"
-            "QComboBox,QSpinBox,QDoubleSpinBox,QLineEdit{background:#171d26;border:1px solid #344052;border-radius:8px;padding:8px;color:#e8edf5;}"
+            "QPushButton::menu-indicator{width:12px;height:12px;subcontrol-origin:padding;subcontrol-position:center right;margin-right:9px;}"
+            "QMenu{background:#171d26;color:#e8edf5;border:1px solid #344052;border-radius:8px;padding:5px;}"
+            "QMenu::item{padding:8px 18px;border-radius:5px;}"
+            "QMenu::item:selected{background:#285fae;color:white;}"
+            "QComboBox,QSpinBox,QDoubleSpinBox,QLineEdit{background:#171d26;border:1px solid #344052;border-radius:8px;padding:8px;color:#e8edf5;outline:0;}"
             "QComboBox:focus,QSpinBox:focus,QDoubleSpinBox:focus,QLineEdit:focus{border-color:#4a8cff;}"
+            "QComboBox{padding-right:12px;}"
+            "QComboBox QAbstractItemView{background:#171d26;color:#e8edf5;border:1px solid #344052;border-radius:8px;padding:4px;outline:0;selection-background-color:#285fae;selection-color:white;}"
+            "QComboBox QAbstractItemView::item{min-height:30px;padding:5px 9px;border:0;outline:0;}"
+            "QComboBox QAbstractItemView::item:hover{background:#233047;color:white;}"
             "QTextEdit{background:#0b0f15;border:1px solid #293343;border-radius:10px;padding:14px;selection-background-color:#315f9f;}"
             "QScrollBar:vertical{background:transparent;width:10px;margin:5px 2px;}"
             "QScrollBar::handle:vertical{background:#354154;border-radius:5px;min-height:32px;}"
@@ -1347,9 +1492,15 @@ class MainWindow(QMainWindow):
         self.device_combo = QComboBox()
         self.device_combo.setMinimumWidth(420)
         controls.addWidget(self.device_combo, 1)
-        refresh = QPushButton("刷新")
-        refresh.clicked.connect(self._refresh_devices)
-        controls.addWidget(refresh)
+        self.quick_source_button = QPushButton("快速选择")
+        quick_source_menu = QMenu(self.quick_source_button)
+        meeting_action = quick_source_menu.addAction("Meeting · CABLE Output")
+        meeting_action.triggered.connect(lambda: self._quick_select_device("meeting"))
+        testing_action = quick_source_menu.addAction("Testing · 当前电脑音频")
+        testing_action.triggered.connect(lambda: self._quick_select_device("testing"))
+        self.quick_source_button.setMenu(quick_source_menu)
+        self.quick_source_button.setToolTip("重新扫描设备并选择常用字幕音源")
+        controls.addWidget(self.quick_source_button)
         self.start_button = QPushButton("开始录制")
         self.start_button.setObjectName("primaryButton")
         self.start_button.clicked.connect(self._toggle_live)
@@ -1724,9 +1875,8 @@ class MainWindow(QMainWindow):
         device_keyword = SETTINGS.get("live", "device_keyword", "CABLE Output")
         for index, label, api, name in candidates:
             self.device_indices.append(index)
-            self.device_combo.addItem(label)
-            if device_keyword.lower() in name.lower() and api == "Windows WASAPI":
-                preferred = self.device_combo.count() - 1
+            self.device_combo.addItem(label, {"name": name, "api": api})
+        preferred = find_audio_device(candidates, device_keyword, "Windows WASAPI")
         if preferred is None:
             for pos, (_, _, _, name) in enumerate(candidates):
                 if device_keyword.lower() in name.lower():
@@ -1734,6 +1884,34 @@ class MainWindow(QMainWindow):
                     break
         if preferred is not None:
             self.device_combo.setCurrentIndex(preferred)
+        loopback_source = {
+            "type": "system_loopback",
+            "name": "电脑音频（自动检测当前扬声器）",
+            "api": "Windows WASAPI loopback",
+        }
+        self.device_indices.append(loopback_source)
+        self.device_combo.addItem(
+            "电脑音频（自动检测当前扬声器） · Windows WASAPI loopback",
+            loopback_source,
+        )
+
+    def _quick_select_device(self, profile):
+        name_keyword, api_name = QUICK_AUDIO_SOURCES[profile]
+        self._refresh_devices()
+        for position in range(self.device_combo.count()):
+            device = self.device_combo.itemData(position) or {}
+            is_match = (
+                device.get("type") == "system_loopback"
+                if profile == "testing"
+                else name_keyword.lower() in device.get("name", "").lower()
+                and device.get("api") == api_name
+            )
+            if is_match:
+                self.device_combo.setCurrentIndex(position)
+                label = "Meeting" if profile == "meeting" else "Testing"
+                self.status_label.setText(f"已选择 {label} 音源：{self.device_combo.currentText()}")
+                return
+        self._show_error(f"没有找到 {name_keyword} · {api_name}，请检查对应音频设备是否可用。")
 
     def _start_live(self):
         pos = self.device_combo.currentIndex()

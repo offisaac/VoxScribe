@@ -7,6 +7,7 @@ VoxScribe is a Windows desktop app for real-time captions and offline media tran
 ## Features
 
 - Real-time recording from Windows audio devices, including VB-CABLE.
+- Quick audio-source presets for meeting audio (`CABLE Output`) and currently playing system audio (automatic Windows loopback detection).
 - Local Qwen3-ASR streaming captions through a WSL 2 service, with partial results that update as speech arrives.
 - Fun-ASR-Nano as an optional low-latency local live-caption backend.
 - Floating, always-on-top caption window for presentations.
@@ -15,6 +16,7 @@ VoxScribe is a Windows desktop app for real-time captions and offline media tran
 - TXT, SRT, VTT, and JSON transcript exports.
 - Task history, retries, cancellation, transcript viewer, search, editing, and media playback.
 - Optional noise reduction, vocal isolation, speaker clustering, and global hotkeys.
+- Selectable local Demucs vocal-separation models, from fast MDX variants to higher-quality HTDemucs variants.
 - OBS-ready text output that always contains the newest live caption.
 
 ## Built with Codex & GPT-5.6
@@ -107,6 +109,19 @@ Recognition is scoped to Simplified Chinese and English. The language selector s
 ### Fun-ASR-Nano fast mode
 
 Set the live backend to `fun_asr_nano` and place its local model under the configured `fun_asr_nano_path`. VoxScribe uses short audio chunks in this mode to prioritize responsiveness. It does not require WSL.
+
+## Audio source shortcuts
+
+The **Quick source** menu on the live-recording screen reduces device-selection mistakes:
+
+- **Meeting · CABLE Output** selects the `CABLE Output` device through the Windows WASAPI host API. Use this when a meeting application or browser is deliberately routed through VB-CABLE.
+- **Testing · current system audio** detects the active physical Windows playback device and captures it through a local loopback. This is useful for transcribing a video already playing on the computer without changing that application's output device.
+
+System loopback capture is local and read-only. It captures playback audio only; a physical microphone must still be routed separately if both sides of a conversation need to be transcribed.
+
+## Audio processing
+
+VoxScribe offers selectable local Demucs models for vocal isolation: balanced **HTDemucs**, higher-quality **HTDemucs FT**, six-source **HTDemucs 6S**, and faster **MDX** variants. The selected model is downloaded by Demucs on first use if it is not already cached. For normal meetings, start with noise reduction or HTDemucs; reserve larger separation models for offline media where processing time is less important.
 
 ## Privacy
 

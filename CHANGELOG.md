@@ -2,6 +2,24 @@
 
 All notable changes to VoxScribe are documented in this file.
 
+## 0.5.0 — 2026-07-17
+
+### Added
+
+- Quick live-audio source menu with an exact WASAPI `CABLE Output` preset for meetings.
+- Local Windows system-audio loopback capture that automatically selects an active playback endpoint for media testing and transcription.
+- Selectable Demucs vocal-isolation models: HTDemucs, HTDemucs FT, HTDemucs 6S, MDX, MDX Extra, and MDX Extra Q.
+
+### Changed
+
+- Live input initialization now retries compatible sample rates and prefers 48 kHz for Windows WDM-KS devices.
+- Settings controls use fixed model choices rather than free-form Demucs model names.
+- Refined dark-theme focus, menu, and combo-box styling for clearer keyboard and mouse interaction.
+
+### Fixed
+
+- Meeting preset selection now matches both the device name and Windows WASAPI host API, preventing accidental selection of an identically named MME endpoint.
+
 ## 0.4.0 — 2026-07-17
 
 ### Added

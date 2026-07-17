@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QMainWindow
 
 from voxscribe.backends import FunASRNanoBackend, _speech_intervals
 from voxscribe.config import SettingsStore
@@ -185,6 +185,79 @@ def test_live_stream_failure_falls_back_to_standard_qwen(tmp_path, app, monkeypa
     assert recorder.recognition_mode == "standard"
     assert mode_changes == ["qwen3_asr"]
     assert live_text == ["普通模式继续识别"]
+
+
+def test_settings_use_fixed_model_choices_without_native_focus_frame(tmp_path, app):
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_settings_controls_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+    store = SettingsStore(tmp_path / "settings.json")
+    dialog = desktop.SettingsDialog(store)
+
+    assert dialog.demucs_model.isEditable() is False
+    assert dialog.demucs_model.findData("htdemucs") >= 0
+    assert dialog.demucs_model.findData("htdemucs_ft") >= 0
+    assert dialog.demucs_model.findData("mdx_extra_q") >= 0
+    assert "outline:0" in dialog.navigation.styleSheet()
+
+    dialog.demucs_model.setCurrentIndex(dialog.demucs_model.findData("mdx_extra_q"))
+    dialog._save()
+    assert store.get("audio_processing", "demucs_model") == "mdx_extra_q"
+
+
+def test_quick_audio_sources_select_exact_host_api(app):
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_quick_audio_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+
+    class FakeWindow:
+        def __init__(self):
+            self.device_combo = QComboBox()
+            self.status_label = QLabel()
+            self.errors = []
+
+        def _refresh_devices(self):
+            self.device_combo.clear()
+            for name, api in (
+                ("CABLE Output (VB-Audio Virtual Cable)", "MME"),
+                ("CABLE Output (VB-Audio Virtual Cable)", "Windows WASAPI"),
+                ("SteelSeries Sonar - Stream (SteelSeries_Sonar_VAD Stream Wave)", "Windows WDM-KS"),
+            ):
+                self.device_combo.addItem(f"{name} · {api}", {"name": name, "api": api})
+            self.device_combo.addItem(
+                "电脑音频（自动检测当前扬声器） · Windows WASAPI loopback",
+                {
+                    "type": "system_loopback",
+                    "name": "电脑音频（自动检测当前扬声器）",
+                    "api": "Windows WASAPI loopback",
+                },
+            )
+
+        def _show_error(self, message):
+            self.errors.append(message)
+
+    window = FakeWindow()
+    desktop.MainWindow._quick_select_device(window, "meeting")
+    assert window.device_combo.currentData()["api"] == "Windows WASAPI"
+    desktop.MainWindow._quick_select_device(window, "testing")
+    assert window.device_combo.currentData()["type"] == "system_loopback"
+    assert window.errors == []
+
+
+def test_wdm_ks_capture_prefers_48khz():
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_capture_rates_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+
+    assert desktop.capture_sample_rate_candidates(
+        {"default_samplerate": 44100.0}, "Windows WDM-KS"
+    ) == [48000, 44100]
+    assert desktop.capture_sample_rate_candidates(
+        {"default_samplerate": 44100.0}, "Windows WASAPI"
+    ) == [44100, 48000]
 
 
 def test_error_dialog_is_non_modal_and_reuses_single_window(app):
