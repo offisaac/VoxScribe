@@ -5,7 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import soundfile as sf
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
 
 from voxscribe.backends import FunASRNanoBackend, _speech_intervals
 from voxscribe.config import SettingsStore
@@ -81,7 +82,7 @@ def test_settings_atomic_merge(tmp_path):
     store = SettingsStore(path)
     assert store.get("general", "font_size") == 48
     assert store.get("folder_watch", "enabled") is True
-    assert store.get("live", "recognition_mode") == "streaming"
+    assert store.get("live", "recognition_mode") == "standard"
     assert store.get("live", "standard_backend") == "qwen3_asr"
     store.update_section("live", {"chunk_seconds": 5.0})
     assert json.loads(path.read_text(encoding="utf-8"))["live"]["chunk_seconds"] == 5.0
@@ -119,6 +120,93 @@ def test_qwen_is_available_in_both_live_modes(tmp_path, app, monkeypatch):
     assert recorder.recognition_mode == "streaming"
     assert recorder.backend_name == "qwen3_asr"
     assert recorder.chunk_seconds == store.get("live", "stream_chunk_seconds")
+
+
+def test_live_stream_failure_falls_back_to_standard_qwen(tmp_path, app, monkeypatch):
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_fallback_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update_section(
+        "live",
+        {
+            "recognition_mode": "streaming",
+            "backend": "qwen3_asr",
+            "standard_backend": "qwen3_asr",
+        },
+    )
+    monkeypatch.setattr(desktop, "SETTINGS", store)
+
+    class FakeManager:
+        def __init__(self):
+            self.loaded = []
+            self.transcribed = []
+
+        def ensure_loaded(self, backend_name):
+            self.loaded.append(backend_name)
+
+        def transcribe(self, audio, language=None, backend_name=None):
+            self.transcribed.append((language, backend_name))
+            return "普通模式继续识别"
+
+    class FakeService:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class BrokenSession:
+        def push(self, _audio):
+            raise RuntimeError("HTTP 500")
+
+    manager = FakeManager()
+    service = FakeService()
+    events = desktop.Events()
+    mode_changes = []
+    live_text = []
+    events.live_mode_changed.connect(mode_changes.append)
+    events.live_text.connect(live_text.append)
+    recorder = desktop.LiveRecorder(manager, service, events, TaskStore(tmp_path / "fallback.db"))
+    recorder.sample_rate = 16000
+    recorder.chunk_seconds = 0.8
+    recorder.export_enabled = False
+    recorder.streaming_session = BrokenSession()
+    recorder.session_started = 0.0
+    recorder.audio_queue.put(np.ones(12800, dtype=np.float32) * 0.01)
+    recorder.audio_queue.put(None)
+
+    recorder._worker()
+
+    assert service.stopped is True
+    assert manager.loaded == ["qwen3_asr"]
+    assert manager.transcribed == [(None, "qwen3_asr")]
+    assert recorder.recognition_mode == "standard"
+    assert mode_changes == ["qwen3_asr"]
+    assert live_text == ["普通模式继续识别"]
+
+
+def test_error_dialog_is_non_modal_and_reuses_single_window(app):
+    application_path = Path(__file__).resolve().parents[1] / "app" / "voxscribe.py"
+    spec = importlib.util.spec_from_file_location("voxscribe_error_dialog_test", application_path)
+    desktop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(desktop)
+    window = QMainWindow()
+    window.status_label = QLabel(window)
+    window.error_dialog = None
+
+    desktop.MainWindow._show_error(window, "第一次错误")
+    first_dialog = window.error_dialog
+    desktop.MainWindow._show_error(window, "第二次错误")
+
+    assert window.error_dialog is first_dialog
+    assert first_dialog.text() == "第二次错误"
+    assert first_dialog.windowModality() == Qt.WindowModality.NonModal
+    first_dialog.accept()
+    app.processEvents()
+    assert window.error_dialog is None
+    window.close()
 
 
 def test_vad_intervals_follow_speech():
@@ -207,6 +295,53 @@ def test_qwen_streaming_http_session(monkeypatch):
     assert calls[1][0].endswith("/api/chunk?session_id=session-1")
     assert len(calls[1][1]) == 16000 * 4
     assert calls[2][0].endswith("/api/finish?session_id=session-1")
+
+
+def test_qwen_streaming_session_rotates_before_audio_grows_unbounded(monkeypatch):
+    responses = iter(
+        [
+            {"session_id": "session-1"},
+            {"language": "Chinese", "text": "第一段进行中"},
+            {"language": "Chinese", "text": "第一段完成"},
+            {"session_id": "session-2"},
+            {"language": "Chinese", "text": "第二段进行中"},
+            {"language": "Chinese", "text": "第二段完成"},
+        ]
+    )
+    calls = []
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, value):
+            self.value = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(self.value).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append(request.full_url)
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr("voxscribe.streaming.urlopen", fake_urlopen)
+    session = QwenStreamingSession(
+        "http://127.0.0.1:8765",
+        max_session_audio_seconds=1.0,
+    ).start()
+    session.push(np.zeros(12800, dtype=np.float32))
+    rotated = session.push(np.zeros(12800, dtype=np.float32))
+    final = session.finish()
+
+    assert rotated["text"] == "第一段完成\n第二段进行中"
+    assert final["text"] == "第一段完成\n第二段完成"
+    assert sum("/api/start" in call for call in calls) == 2
+    assert sum("/api/finish" in call for call in calls) == 2
 
 
 def test_qwen_streaming_session_retries_transient_failure(monkeypatch):

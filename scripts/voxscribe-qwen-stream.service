@@ -8,7 +8,7 @@ User=voxscribe
 Environment=HF_HOME=/opt/voxscribe/cache/huggingface
 Environment=MODELSCOPE_CACHE=/opt/voxscribe/cache/modelscope
 Environment=VLLM_WORKER_MULTIPROC_METHOD=spawn
-Environment=VLLM_ENABLE_V1_MULTIPROCESSING=0
+Environment=VLLM_ENABLE_V1_MULTIPROCESSING=1
 Environment=MALLOC_ARENA_MAX=2
 Environment=MALLOC_TRIM_THRESHOLD_=65536
 ExecStart=/opt/voxscribe/runtime/bin/python /opt/voxscribe/services/qwen_stream_server.py --model /opt/voxscribe/models/Qwen3-ASR-1.7B --host 0.0.0.0 --port 8765 --gpu-memory-utilization 0.55 --max-model-len 8192 --swap-space 0 --mm-processor-cache-gb 0 --enforce-eager --chunk-size-sec 0.8

@@ -91,11 +91,18 @@ sudo systemctl disable voxscribe-qwen-stream
 
 In VoxScribe settings, select **Qwen3-ASR 1.7B** as the live model. The app checks the local service and starts it through the configured WSL distribution when necessary. It keeps the model loaded while VoxScribe is open and shuts WSL down when VoxScribe exits. `streaming_url` and `wsl_distro` can be changed in `config/settings.json`.
 
-The bundled service is tuned for one live transcription session: a single-process vLLM engine, eager CUDA execution, no CPU swap reservation, an 8K context, a 55% GPU memory target, and no multimodal processor cache. The processor cache is intentionally disabled because live audio chunks are unique and do not benefit from reuse. These defaults prioritize low Windows RAM use over maximum batch throughput.
+The bundled service is tuned for one live transcription session: an isolated multiprocess vLLM engine, eager CUDA execution, no CPU swap reservation, an 8K context, a 55% GPU memory target, and no multimodal processor cache. VoxScribe automatically rotates the server-side streaming session every 20 seconds of audio so inference cost stays bounded during long interviews while committed captions remain in the transcript. The processor cache is intentionally disabled because live audio chunks are unique and do not benefit from reuse.
 
-Live recording exposes two independent Qwen modes. **True streaming** uses the WSL service for low-latency revisions. **Standard segmented** loads the same Qwen3-ASR 1.7B model directly on Windows and does not depend on the WSL streaming session. Standard Qwen is the default fallback when streaming startup fails. Switching modes unloads the previous runtime before loading the new one so both model copies are not kept in RAM together.
+Live recording exposes two independent Qwen modes. **True streaming** uses the WSL service for low-latency revisions. **Standard segmented** loads the same Qwen3-ASR 1.7B model directly on Windows and does not depend on the WSL streaming session. Standard Qwen is the safe default and automatic fallback when streaming startup or a live streaming request fails. Audio already entering the recorder stays queued during fallback, the poisoned WSL service is stopped, and recording continues with standard Qwen. Switching modes unloads the previous runtime before loading the new one so both model copies are not kept in RAM together.
 
 Recognition is scoped to Simplified Chinese and English. The language selector supports automatic Chinese/English detection, forced Simplified Chinese, or forced English. Translation is disabled, and all recognized Chinese text is normalized to Simplified Chinese before display and export.
+
+### Reliability during long sessions
+
+- The example configuration starts in **Standard segmented** mode so the app remains usable without a running WSL service.
+- If a true-streaming request fails, VoxScribe preserves queued audio, stops the failed WSL runtime, loads the configured standard backend, and continues the active recording.
+- Runtime recognition errors trigger a safe stop and transcript finalization instead of leaving the audio device or export file in an indeterminate state.
+- Error notifications are non-modal and coalesced, so an unavailable service does not lock the recording interface behind repeated dialog windows.
 
 ### Fun-ASR-Nano fast mode
 

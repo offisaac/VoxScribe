@@ -204,6 +204,8 @@ class Events(QObject):
     audio_level = Signal(float)
     live_started = Signal()
     live_start_failed = Signal(str)
+    live_mode_changed = Signal(str)
+    live_runtime_failed = Signal(str)
     live_stopped = Signal(bool)
     live_stop_failed = Signal(str)
 
@@ -804,6 +806,23 @@ class LiveRecorder:
                 self.streaming_session = None
         self._finalize_session()
 
+    def _activate_standard_fallback(self):
+        self.events.status.emit("流式识别异常，正在切换普通 Qwen；录音会继续缓存…")
+        self.streaming_session = None
+        self.streaming_service.stop()
+        backend_name = SETTINGS.get("live", "standard_backend", "qwen3_asr")
+        self.recognition_mode = "standard"
+        self.backend_name = backend_name
+        configured_chunk = float(SETTINGS.get("live", "chunk_seconds", 3.5))
+        self.chunk_seconds = (
+            min(configured_chunk, 2.0)
+            if backend_name == "fun_asr_nano"
+            else configured_chunk
+        )
+        self.manager.ensure_loaded(backend_name)
+        self.events.live_mode_changed.emit(backend_name)
+        return backend_name
+
     def _worker(self):
         chunks = []
         total = 0
@@ -839,22 +858,21 @@ class LiveRecorder:
                     try:
                         response = self.streaming_session.push(audio)
                     except Exception:
-                        LOGGER.exception("Qwen 流式会话中断，正在自动恢复")
-                        self.events.status.emit("识别服务中断，正在自动恢复…")
-                        self.streaming_service.ready = False
-                        self.streaming_session = self.streaming_service.create_session()
-                        response = self.streaming_session.push(audio)
-                        self.events.status.emit("识别服务已自动恢复")
-                    text = (response.get("text") or "").strip()
-                    if text and text != self.last_text:
-                        self.last_text = text
-                        elapsed = time.monotonic() - self.session_started
-                        self.segments = [Segment(0.0, elapsed, text)]
-                        self._save_snapshot(text)
-                        self.events.live_snapshot.emit(text)
-                    if finishing:
-                        break
-                    continue
+                        LOGGER.exception("Qwen 流式会话中断，切换普通模式")
+                        backend_name = self._activate_standard_fallback()
+                        is_streaming = False
+                        target = int(self.sample_rate * self.chunk_seconds)
+                    else:
+                        text = (response.get("text") or "").strip()
+                        if text and text != self.last_text:
+                            self.last_text = text
+                            elapsed = time.monotonic() - self.session_started
+                            self.segments = [Segment(0.0, elapsed, text)]
+                            self._save_snapshot(text)
+                            self.events.live_snapshot.emit(text)
+                        if finishing:
+                            break
+                        continue
                 language = SETTINGS.get("model", "language", "auto")
                 text = self.manager.transcribe(
                     (audio, 16000),
@@ -870,7 +888,8 @@ class LiveRecorder:
                         self.events.live_text.emit(text)
             except Exception as exc:
                 LOGGER.exception("实时识别失败")
-                self.events.error.emit(f"实时识别失败：{exc}")
+                self.events.live_runtime_failed.emit(f"实时识别失败：{exc}")
+                break
             if finishing:
                 break
 
@@ -1208,6 +1227,8 @@ class MainWindow(QMainWindow):
         self.model_is_ready = False
         self.live_starting = False
         self.live_stopping = False
+        self.pending_live_error = ""
+        self.error_dialog = None
         self.setWindowTitle("VoxScribe")
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "voxscribe.ico")))
         self.resize(1080, 720)
@@ -1522,6 +1543,8 @@ class MainWindow(QMainWindow):
         self.events.audio_level.connect(self._update_audio_meter)
         self.events.live_started.connect(self._live_started)
         self.events.live_start_failed.connect(self._live_start_failed)
+        self.events.live_mode_changed.connect(self._live_mode_changed)
+        self.events.live_runtime_failed.connect(self._live_runtime_failed)
         self.events.live_stopped.connect(self._live_stopped)
         self.events.live_stop_failed.connect(self._live_stop_failed)
 
@@ -1768,6 +1791,25 @@ class MainWindow(QMainWindow):
         self.live_model_state.setStyleSheet("color:#ff7d88;font-weight:600;")
         self._show_error(f"无法启动音频输入：{message}")
 
+    def _live_mode_changed(self, backend_name):
+        SETTINGS.update_section(
+            "live",
+            {
+                "recognition_mode": "standard",
+                "backend": backend_name,
+            },
+        )
+        label = BACKEND_INFO.get(backend_name, {}).get("label", backend_name)
+        self.live_model_state.setText(f"● 普通分段录制中 · {label}")
+        self.live_model_state.setStyleSheet("color:#f6c85f;font-weight:600;")
+        self.status_label.setText("流式服务异常，已自动切换普通 Qwen；录音和转录继续进行。")
+
+    def _live_runtime_failed(self, message):
+        self.pending_live_error = message
+        self.status_label.setText(f"识别异常，正在安全停止并保存：{message}")
+        if not self.live_stopping:
+            self._stop_live()
+
     def _stop_live(self):
         if self.live_starting or self.live_stopping:
             return
@@ -1808,6 +1850,11 @@ class MainWindow(QMainWindow):
             self.status_label.setText("录制已保存；模型内存和显存已释放。")
         else:
             self._model_ready()
+        if self.pending_live_error:
+            self.live_model_state.setText("● 识别已安全停止 · 录制文件已保存")
+            self.live_model_state.setStyleSheet("color:#ff7d88;font-weight:600;")
+            self.status_label.setText(self.pending_live_error)
+            self.pending_live_error = ""
             self.status_label.setText("录制已保存；模型保持就绪。")
 
     def _live_stop_failed(self, message):
@@ -1971,7 +2018,25 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, message):
         self.status_label.setText(message)
-        QMessageBox.critical(self, "VoxScribe", message)
+        if self.error_dialog is not None and self.error_dialog.isVisible():
+            self.error_dialog.setText(message)
+            self.error_dialog.raise_()
+            return
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("VoxScribe")
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setText(message)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        def clear_dialog(_result):
+            if self.error_dialog is dialog:
+                self.error_dialog = None
+
+        dialog.finished.connect(clear_dialog)
+        self.error_dialog = dialog
+        dialog.show()
 
     def closeEvent(self, event):
         self.recorder.stop()

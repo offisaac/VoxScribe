@@ -7,8 +7,8 @@
   "live": {
     "device_keyword": "CABLE Output",
     "backend": "qwen3_asr",
-    "recognition_mode": "streaming",
-    "standard_backend": "fun_asr_nano",
+    "recognition_mode": "standard",
+    "standard_backend": "qwen3_asr",
     "streaming_url": "http://127.0.0.1:8765",
     "wsl_distro": "Ubuntu",
     "stream_chunk_seconds": 0.8,

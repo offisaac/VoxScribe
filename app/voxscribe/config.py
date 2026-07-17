@@ -15,7 +15,7 @@ DEFAULT_SETTINGS = {
     "live": {
         "device_keyword": "CABLE Output",
         "backend": "qwen3_asr",
-        "recognition_mode": "streaming",
+        "recognition_mode": "standard",
         "standard_backend": "qwen3_asr",
         "streaming_url": "http://127.0.0.1:8765",
         "wsl_distro": "Ubuntu",

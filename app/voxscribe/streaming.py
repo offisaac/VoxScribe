@@ -19,13 +19,17 @@ class QwenStreamingSession:
         chunk_seconds=0.8,
         unfixed_chunk_num=4,
         unfixed_token_num=5,
+        max_session_audio_seconds=20.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.chunk_seconds = float(chunk_seconds)
         self.unfixed_chunk_num = int(unfixed_chunk_num)
         self.unfixed_token_num = int(unfixed_token_num)
+        self.max_session_audio_seconds = float(max_session_audio_seconds)
         self.session_id = None
+        self.session_audio_seconds = 0.0
+        self.committed_text = ""
 
     def _post(self, path, data=b"", content_type="application/json", timeout=None):
         request = Request(
@@ -40,7 +44,7 @@ class QwenStreamingSession:
                 result["text"] = normalize_recognition_text(result["text"])
             return result
 
-    def start(self):
+    def _start_current(self):
         payload = json.dumps(
             {
                 "chunk_size_sec": self.chunk_seconds,
@@ -49,20 +53,19 @@ class QwenStreamingSession:
             }
         ).encode("utf-8")
         self.session_id = self._post("/api/start", payload)["session_id"]
+        self.session_audio_seconds = 0.0
+
+    def start(self):
+        self.committed_text = ""
+        self._start_current()
         return self
 
-    def push(self, samples):
-        if not self.session_id:
-            raise RuntimeError("流式识别会话尚未开始")
-        audio = np.ascontiguousarray(samples, dtype="<f4")
-        query = urlencode({"session_id": self.session_id})
-        return self._post(
-            f"/api/chunk?{query}",
-            audio.tobytes(),
-            "application/octet-stream",
-        )
+    def _with_committed(self, result):
+        current = (result.get("text") or "").strip()
+        result["text"] = "\n".join(part for part in (self.committed_text, current) if part)
+        return result
 
-    def finish(self):
+    def _finish_current(self):
         if not self.session_id:
             return {"language": "", "text": ""}
         query = urlencode({"session_id": self.session_id})
@@ -70,6 +73,38 @@ class QwenStreamingSession:
             return self._post(f"/api/finish?{query}", timeout=3)
         finally:
             self.session_id = None
+
+    def _rotate(self):
+        result = self._finish_current()
+        text = (result.get("text") or "").strip()
+        if text:
+            self.committed_text = "\n".join(
+                part for part in (self.committed_text, text) if part
+            )
+        self._start_current()
+
+    def push(self, samples):
+        if not self.session_id:
+            raise RuntimeError("流式识别会话尚未开始")
+        audio = np.ascontiguousarray(samples, dtype="<f4")
+        audio_seconds = len(audio) / 16000.0
+        if (
+            self.session_audio_seconds > 0
+            and self.session_audio_seconds + audio_seconds > self.max_session_audio_seconds
+        ):
+            self._rotate()
+        query = urlencode({"session_id": self.session_id})
+        result = self._post(
+            f"/api/chunk?{query}",
+            audio.tobytes(),
+            "application/octet-stream",
+        )
+        self.session_audio_seconds += audio_seconds
+        return self._with_committed(result)
+
+    def finish(self):
+        result = self._finish_current()
+        return self._with_committed(result)
 
 
 class QwenStreamingService:
@@ -80,12 +115,14 @@ class QwenStreamingService:
         chunk_seconds=0.8,
         unfixed_chunk_num=4,
         unfixed_token_num=5,
+        max_session_audio_seconds=20.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.distro = distro
         self.chunk_seconds = float(chunk_seconds)
         self.unfixed_chunk_num = int(unfixed_chunk_num)
         self.unfixed_token_num = int(unfixed_token_num)
+        self.max_session_audio_seconds = float(max_session_audio_seconds)
         self.keepalive = None
         self.ready = False
         self.cache_trimmed = False
@@ -175,6 +212,7 @@ class QwenStreamingService:
                     chunk_seconds=self.chunk_seconds,
                     unfixed_chunk_num=self.unfixed_chunk_num,
                     unfixed_token_num=self.unfixed_token_num,
+                    max_session_audio_seconds=self.max_session_audio_seconds,
                 ).start()
             except Exception as exc:
                 last_error = exc
